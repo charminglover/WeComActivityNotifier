@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import engine
 from engine import (read_excel, text_of, number, rate_number, filter_records,
                     make_jobs, fit_markdown_jobs, render_table, image_bytes,
                     markdown_table, check_webhook, WeComSender)
@@ -28,6 +29,18 @@ class TestCore(unittest.TestCase):
                               count_metric='任务台数',count_operator='>=',count_threshold='10')
         self.assertEqual(len(values),2)
         self.assertTrue(all(rate_number(v['任务执行率']) < 70 for v in values))
+
+    def test_generic_headers_and_search(self):
+        fields, rows = engine._parse_sheets([('Report', iter([
+            ['Quarterly report'],
+            ['Region', 'Revenue', 'Period'],
+            ['North', 1200, '2026-Q1'],
+            ['South', 900, '2026-Q1'],
+        ]))])
+        self.assertEqual(fields, ['Region', 'Revenue', 'Period'])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(filter_records(rows, shop='north')), 1)
+        self.assertEqual(len(filter_records(rows, activity='2026-Q1')), 2)
 
     def test_jobs_and_paging(self):
         jobs=make_jobs(self.records,['任务服务店名称','活动名称','任务执行率'],group_by_shop=True,page_size=1)

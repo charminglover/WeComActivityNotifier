@@ -144,9 +144,23 @@ def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
         if not ahead:
             continue
         marker = ('任务服务店名称', '任务台数', '活动名称', '任务执行率')
-        head_idx = max(range(len(ahead)), key=lambda i: sum(str(c or '').strip() in marker for c in ahead[i]))
+        marker_scores = [sum(str(c or '').strip() in marker for c in row) for row in ahead]
+        best_marker = max(marker_scores, default=0)
+        if best_marker >= 2:
+            head_idx = max(range(len(ahead)), key=lambda i: (marker_scores[i], sum(bool(c is not None and str(c).strip()) for c in ahead[i]), -i))
+        else:
+            # Generic worksheets have no WeCom-specific column names. Prefer the
+            # densest early row as the header; title rows and blank rows score low.
+            head_idx = max(
+                range(len(ahead)),
+                key=lambda i: (
+                    len({str(c).strip() for c in ahead[i] if c is not None and str(c).strip()}),
+                    sum(bool(c is not None and str(c).strip()) for c in ahead[i]),
+                    -i,
+                ),
+            )
         header = [str(x).strip() if x is not None else '' for x in ahead[head_idx]]
-        if sum(k in header for k in marker) < 2:
+        if sum(bool(x) for x in header) < 2:
             continue
         used = set()
         for i, x in enumerate(header):
@@ -170,7 +184,7 @@ def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
             row['_row'] = row_number
             all_records.append(row)
     if not all_records:
-        raise ValueError('没有找到有效数据。请检查首行附近是否包含「任务服务店名称」「活动名称」「任务台数」等列。')
+        raise ValueError('没有找到有效表格。请确认文件前 15 行内包含至少两列表头和数据行。')
     return all_fields, all_records
 
 
@@ -194,9 +208,11 @@ def filter_records(records: list[dict], shop: str = '', activity: str = '', stat
                '>=':lambda a,b: a>=b, '>':lambda a,b: a>b}
     out = []
     for r in records:
-        if shop and shop not in (' '.join(str(r.get(k, '')) for k in ('任务服务店名称','任务服务店编码','任务服务店区域','任务服务店大区','任务服务店服务中心'))).lower():
+        values = ' '.join(str(value) for key, value in r.items()
+                          if not key.startswith('_') and value is not None).lower()
+        if shop and shop not in values:
             continue
-        if activity and activity not in (' '.join(str(r.get(k, '')) for k in ('活动名称', '活动编码'))).lower():
+        if activity and activity not in values:
             continue
         if status and status != '全部' and str(r.get('活动状态') or '').strip() != status:
             continue
@@ -224,7 +240,7 @@ class Job:
 
 
 def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = False,
-              page_size: int = 8, columns_per_page: int = 7, title: str = '售后活动执行进度通知') -> list[Job]:
+              page_size: int = 8, columns_per_page: int = 7, title: str = '数据通知') -> list[Job]:
     if not records or not fields:
         raise ValueError('需要至少选择一条活动记录和一项推送字段')
     page_size = max(1, min(30, int(page_size)))

@@ -35,6 +35,7 @@ class App(tk.Tk):
         self.events = queue.Queue()
         self.records = []
         self.fields = []
+        self.display_fields = []
         self.field_flags = {}
         self.filtered = []
         self.checked = set()
@@ -78,13 +79,13 @@ class App(tk.Tk):
         self.shop_var = tk.StringVar()
         self.act_var = tk.StringVar()
         self.status_var = tk.StringVar(value='全部')
-        self.metric_var = tk.StringVar(value='任务执行率')
+        self.metric_var = tk.StringVar()
         self.comp_var = tk.StringVar(value='<')
         self.threshold_var = tk.StringVar()
-        self.qty_metric = tk.StringVar(value='任务台数')
+        self.qty_metric = tk.StringVar()
         self.qty_comp = tk.StringVar(value='>')
         self.qty_threshold = tk.StringVar()
-        self.msg_title = tk.StringVar(value=p.get('msg_title','售后活动执行进度通知'))
+        self.msg_title = tk.StringVar(value=p.get('msg_title','数据通知'))
         self.mode_var = tk.StringVar(value=p.get('mode','图片表格'))
         self.page_var = tk.StringVar(value=str(p.get('page_size',12)))
         self.column_var = tk.StringVar(value=str(p.get('col_size',6)))
@@ -131,27 +132,32 @@ class App(tk.Tk):
         filters.pack(fill='x')
         for i in range(12):
             filters.columnconfigure(i,weight=1 if i in (1,4) else 0)
-        ttk.Label(filters,text='服务店/区域').grid(row=0,column=0,sticky='w')
+        ttk.Label(filters,text='关键词 1（搜索全部列）').grid(row=0,column=0,sticky='w')
         ttk.Entry(filters,textvariable=self.shop_var,width=23).grid(row=0,column=1,sticky='ew',padx=(4,15))
-        ttk.Label(filters,text='活动名称/编码').grid(row=0,column=2,sticky='w')
+        ttk.Label(filters,text='关键词 2（搜索全部列）').grid(row=0,column=2,sticky='w')
         ttk.Entry(filters,textvariable=self.act_var,width=24).grid(row=0,column=3,sticky='ew',padx=(4,15))
-        ttk.Label(filters,text='活动状态').grid(row=0,column=4,sticky='w')
+        self.status_label=ttk.Label(filters,text='状态筛选（可选）')
+        self.status_label.grid(row=0,column=4,sticky='w')
         self.status_select=ttk.Combobox(filters,textvariable=self.status_var,values=['全部'],state='readonly',width=13)
         self.status_select.grid(row=0,column=5,sticky='w',padx=(4,15))
         ttk.Button(filters,text='执行筛选',command=self.apply_filters).grid(row=0,column=6,padx=5)
         ttk.Button(filters,text='清除条件',command=self.clear_filters).grid(row=0,column=7,padx=5)
-        ttk.Label(filters,text='完成率条件').grid(row=1,column=0,sticky='w',pady=(10,0))
+        ttk.Label(filters,text='数值条件 1').grid(row=1,column=0,sticky='w',pady=(10,0))
         self.metric_select=ttk.Combobox(filters,textvariable=self.metric_var,width=20,state='readonly')
         self.metric_select.grid(row=1,column=1,sticky='w',pady=(10,0))
-        ttk.Combobox(filters,textvariable=self.comp_var,values=['<','<=','=','>=','>'],width=4,state='readonly').grid(row=1,column=2,sticky='e',pady=(10,0))
-        ttk.Entry(filters,textvariable=self.threshold_var,width=8).grid(row=1,column=3,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='(例如 80，空白不限制)').grid(row=1,column=4,columnspan=2,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='数量条件').grid(row=2,column=0,sticky='w',pady=(10,0))
+        self.comp_select=ttk.Combobox(filters,textvariable=self.comp_var,values=['<','<=','=','>=','>'],width=4,state='readonly')
+        self.comp_select.grid(row=1,column=2,sticky='e',pady=(10,0))
+        self.threshold_entry=ttk.Entry(filters,textvariable=self.threshold_var,width=8)
+        self.threshold_entry.grid(row=1,column=3,sticky='w',pady=(10,0))
+        ttk.Label(filters,text='（对数字列进行筛选）').grid(row=1,column=4,columnspan=2,sticky='w',pady=(10,0))
+        ttk.Label(filters,text='数值条件 2').grid(row=2,column=0,sticky='w',pady=(10,0))
         self.qty_select=ttk.Combobox(filters,textvariable=self.qty_metric,width=20,state='readonly')
         self.qty_select.grid(row=2,column=1,sticky='w',pady=(10,0))
-        ttk.Combobox(filters,textvariable=self.qty_comp,values=['<','<=','=','>=','>'],width=4,state='readonly').grid(row=2,column=2,sticky='e',pady=(10,0))
-        ttk.Entry(filters,textvariable=self.qty_threshold,width=8).grid(row=2,column=3,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='(例如 5，空白不限制)').grid(row=2,column=4,columnspan=2,sticky='w',pady=(10,0))
+        self.qty_comp_select=ttk.Combobox(filters,textvariable=self.qty_comp,values=['<','<=','=','>=','>'],width=4,state='readonly')
+        self.qty_comp_select.grid(row=2,column=2,sticky='e',pady=(10,0))
+        self.qty_threshold_entry=ttk.Entry(filters,textvariable=self.qty_threshold,width=8)
+        self.qty_threshold_entry.grid(row=2,column=3,sticky='w',pady=(10,0))
+        ttk.Label(filters,text='（可再选一个数字列）').grid(row=2,column=4,columnspan=2,sticky='w',pady=(10,0))
         tools=ttk.Frame(self.page_data)
         tools.pack(fill='x',pady=(10,6))
         ttk.Button(tools,text='勾选当前筛选结果',command=lambda:self.select_filtered('all')).pack(side='left',padx=(0,5))
@@ -161,16 +167,15 @@ class App(tk.Tk):
         ttk.Label(tools,text='单击左侧复选框，或选中行后按空格；双击行也可切换').pack(side='right')
         area=ttk.Frame(self.page_data)
         area.pack(fill='both',expand=True)
-        display=['任务服务店编码','任务服务店名称','活动编码','活动名称','活动状态','任务台数','任务车辆执行台数','任务执行率','按期执行率']
-        self.tree=ttk.Treeview(area,columns=display,show='tree headings',selectmode='extended')
-        self.tree.heading('#0', text='勾选')
-        self.tree.column('#0', width=62, minwidth=62, stretch=False, anchor='center')
+        content=ttk.Frame(area)
+        content.grid(row=0,column=0,sticky='nsew')
+        self.tree=ttk.Treeview(content,columns=(),show='tree',selectmode='extended')
+        self.tree.heading('#0',text='')
+        self.tree.column('#0',width=0,minwidth=0,stretch=False,anchor='center')
         self.tree.tag_configure('checked', background='#EBF2FB')
-        widths=[135,225,100,300,100,85,115,100,100]
-        for f,w in zip(display,widths):
-            self.tree.heading(f,text=f)
-            self.tree.column(f,width=w,minwidth=60,anchor='center' if f in ('任务台数','任务车辆执行台数','任务执行率','按期执行率') else 'w')
-        self.tree.grid(row=0,column=0,sticky='nsew')
+        self.tree.pack(fill='both',expand=True)
+        self.table_placeholder=ttk.Label(content,text='导入 Excel 或 CSV 后，将按实际表头显示数据列',anchor='center')
+        self.table_placeholder.place(relx=.5,rely=.5,anchor='center')
         sv=ttk.Scrollbar(area,orient='vertical',command=self.tree.yview)
         sh=ttk.Scrollbar(area,orient='horizontal',command=self.tree.xview)
         self.tree.configure(yscrollcommand=sv.set,xscrollcommand=sh.set)
@@ -304,14 +309,9 @@ class App(tk.Tk):
                     self.records=records
                     self.checked.clear()
                     self.fields=fields
+                    self._configure_data_columns(fields)
                     self._fill_fields()
-                    self.status_select.configure(values=['全部']+sorted({text_of(r.get('活动状态')) for r in records if text_of(r.get('活动状态'))}))
-                    rfields=[c for c in fields if any(x in c for x in ('率','完成率'))]
-                    cfields=[c for c in fields if ('台数' in c or '数量' in c)]
-                    self.metric_select.configure(values=rfields)
-                    self.qty_select.configure(values=cfields)
-                    if self.metric_var.get() not in rfields and rfields: self.metric_var.set(rfields[0])
-                    if self.qty_metric.get() not in cfields and cfields: self.qty_metric.set(cfields[0])
+                    self._configure_filter_fields(fields,records)
                     self.apply_filters()
                     self._log(f'导入成功：{len(records)} 行，{len(fields)} 列。')
                 elif typ == 'filtered':
@@ -348,10 +348,49 @@ class App(tk.Tk):
         self.btn_send.config(state='normal')
         self.btn_stop.config(state='disabled')
 
+    def _configure_data_columns(self, fields):
+        self.display_fields=list(fields)
+        column_ids=[f'data_{i}' for i in range(len(self.display_fields))]
+        self.tree.configure(columns=column_ids,show='tree headings')
+        self.tree.heading('#0',text='勾选')
+        self.tree.column('#0',width=62,minwidth=62,stretch=False,anchor='center')
+        for column_id,field in zip(column_ids,self.display_fields):
+            width=max(110,min(280,24+18*len(field)))
+            self.tree.heading(column_id,text=field)
+            self.tree.column(column_id,width=width,minwidth=70,anchor='w')
+        self.table_placeholder.place_forget()
+
+    def _configure_filter_fields(self, fields, records):
+        if '活动状态' in fields:
+            values=sorted({text_of(r.get('活动状态')) for r in records if text_of(r.get('活动状态'))})
+            self.status_select.configure(values=['全部']+values,state='readonly')
+            self.status_label.configure(text='状态筛选')
+        else:
+            self.status_var.set('全部')
+            self.status_select.configure(values=['全部'],state='disabled')
+            self.status_label.configure(text='状态筛选（无此列）')
+
+        sample=records[:500]
+        numeric_fields=[f for f in fields if any(number(r.get(f)) is not None for r in sample)]
+        for selector,variable,operator,entry in (
+            (self.metric_select,self.metric_var,self.comp_select,self.threshold_entry),
+            (self.qty_select,self.qty_metric,self.qty_comp_select,self.qty_threshold_entry),
+        ):
+            selector.configure(values=numeric_fields,state='readonly' if numeric_fields else 'disabled')
+            if variable.get() not in numeric_fields:
+                variable.set(numeric_fields[0] if numeric_fields else '')
+            operator.configure(state='readonly' if numeric_fields else 'disabled')
+            entry.configure(state='normal' if numeric_fields else 'disabled')
+
     def _fill_fields(self):
         if not self._checkbox_images:
             self._checkbox_images = self._create_checkbox_images()
-        last=set(self.prefs.get('fields', DEFAULT_FIELDS))
+        saved=self.prefs.get('fields')
+        if saved is None or (saved and not set(saved).intersection(self.fields)):
+            recommended=[f for f in self.fields if f in DEFAULT_FIELDS]
+            last=set(recommended or self.fields[:8])
+        else:
+            last=set(saved)
         preferred=[x for x in self.prefs.get('order',[]) if x in self.fields]
         self.fields=preferred+[x for x in self.fields if x not in preferred]
         self.field_flags={x:x in last for x in self.fields}
@@ -398,8 +437,9 @@ class App(tk.Tk):
         self._refresh_fields(nextindex)
 
     def set_fields(self, mode):
+        recommended=[f for f in self.fields if f in DEFAULT_FIELDS] or self.fields[:8]
         for f in self.fields:
-            self.field_flags[f]=mode=='all' or (mode=='recommended' and f in DEFAULT_FIELDS)
+            self.field_flags[f]=mode=='all' or (mode=='recommended' and f in recommended)
         self._refresh_fields()
 
     def clear_filters(self):
@@ -434,7 +474,7 @@ class App(tk.Tk):
         if tag!=self._table_generation: return
         target=min(len(self.filtered),self.display_limit)
         end=min(start+125,target)
-        keys=['任务服务店编码','任务服务店名称','活动编码','活动名称','活动状态','任务台数','任务车辆执行台数','任务执行率','按期执行率']
+        keys=self.display_fields
         for index in range(start,end):
             r=self.filtered[index]
             enabled=r['_id'] in self.checked
