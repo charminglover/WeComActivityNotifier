@@ -14,12 +14,12 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -39,6 +39,8 @@ MAX_IMAGE_WIDTH = 3000
 MAX_IMAGE_HEIGHT = 6500
 MAX_IMAGE_PIXELS = 16_000_000
 MAX_MARKDOWN_SAFE = 3900
+MAX_EXCEL_BYTES = 19_900_000  # margin below the official 20 MB file limit
+EXCEL_MODE = 'Excel附件'
 USER_AGENT = 'WeComActivityNotifier/2.0'
 
 
@@ -300,31 +302,40 @@ class Job:
     parts: int = 1
     group_field: str = ''
     group_value: str = ''
+    route_field: str = ''
+    route_value: str = ''
 
 
 def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = False,
-              page_size: int = 8, columns_per_page: int = 7, title: str = '数据通知',
-              group_by_field: str = '', route_by_store: bool = False) -> list[Job]:
+              page_size: int | None = 8, columns_per_page: int | None = 7, title: str = '数据通知',
+              group_by_field: str = '', route_by_store: bool = False,
+              route_field: str = '') -> list[Job]:
     """Build message pages, optionally grouped by any imported column.
 
-    ``group_by_shop`` is retained for callers of earlier versions. Store routing
-    can be kept separate from the displayed grouping when per-store mappings exist.
+    Routing is independent of content grouping. ``None`` page limits retain a
+    full table for XLSX attachments, bounded by Excel worksheet dimensions.
+    Legacy shop arguments remain available for older callers.
     """
     if not records or not fields:
-        raise ValueError('需要至少选择一条活动记录和一项推送字段')
+        raise ValueError('需要至少选择一条记录和一项推送字段')
     if group_by_shop and not group_by_field:
         group_by_field = KEY_STORE
         route_by_store = True
-    page_size = max(1, min(30, int(page_size)))
-    columns_per_page = max(2, min(10, int(columns_per_page)))
+    if route_by_store and not route_field:
+        route_field = KEY_STORE
+    if route_field and any(route_field not in row for row in records):
+        raise ValueError(f'所选记录缺少映射匹配列“{route_field}”，请重新选择匹配字段。')
+    page_size = 1_048_575 if page_size is None else max(1, min(30, int(page_size)))
+    columns_per_page = 16_384 if columns_per_page is None else max(2, min(10, int(columns_per_page)))
     groups = defaultdict(list)
     for row in records:
-        code = text_of(row.get(KEY_STORE)) if route_by_store else ''
-        name = text_of(row.get(NAME_STORE)) if route_by_store else ''
+        code = text_of(row.get(KEY_STORE)) if route_field == KEY_STORE else ''
+        name = text_of(row.get(NAME_STORE)) if route_field == KEY_STORE else ''
+        route_value = text_of(row.get(route_field), route_field) if route_field else ''
         group_value = text_of(row.get(group_by_field), group_by_field) if group_by_field else ''
-        groups[(code, name, group_value)].append(row)
+        groups[(code, name, route_value, group_value)].append(row)
     jobs = []
-    for (code, name, group_value), entries in groups.items():
+    for (code, name, route_value, group_value), entries in groups.items():
         row_parts = [entries[i:i+page_size] for i in range(0, len(entries), page_size)]
         field_parts = [fields[i:i+columns_per_page] for i in range(0, len(fields), columns_per_page)]
         part_total = len(row_parts) * len(field_parts)
@@ -334,7 +345,8 @@ def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = Fals
             for fieldpart in field_parts:
                 jobs.append(Job(title=group_title, fields=fieldpart, rows=rowpart, store_code=code,
                                 store_name=name, parts=part_total, group_field=group_by_field,
-                                group_value=group_value))
+                                group_value=group_value, route_field=route_field,
+                                route_value=route_value))
         for idx, job in enumerate(jobs[start:], 1):
             job.part = idx
     return jobs
@@ -480,9 +492,11 @@ def render_table(job: Job, warning_rate: float | None = None,
     d.text((36, 28), job.title, fill='#202020', font=titlefont)
     if job.group_field:
         subtitle = f'按{job.group_field}：{job.group_value}  ·  '
+    elif job.route_field:
+        subtitle = f'{job.route_field}：{job.route_value}  ·  '
     else:
         subtitle = f'{job.store_name}  ' if job.store_name else ''
-    subtitle += f'共 {len(job.rows)} 条活动  ·  第 {job.part}/{job.parts} 页'
+    subtitle += f'共 {len(job.rows)} 条记录  ·  第 {job.part}/{job.parts} 页'
     d.text((36, 82), _trim(d, subtitle, small, full_width - 72), fill='#666666', font=small)
     y = 122
     x = 36
@@ -540,6 +554,7 @@ def markdown_table(job: Job, highlight_conditions: list[dict] | None = None) -> 
     def esc(s):
         return str(s).replace('|','\\|').replace('\n', ' ').replace('\r',' ').replace('`', '\\`')
     subtitle = (f'按{job.group_field}：{job.group_value} · ' if job.group_field else
+                f'{job.route_field}：{job.route_value} · ' if job.route_field else
                 f'{job.store_name} · ' if job.store_name else '')
     lines = [f'## {esc(job.title)}', f'> {esc(subtitle)}共 {len(job.rows)} 条 · 第 {job.part}/{job.parts} 页',
              '', '| ' + ' | '.join(esc(f) for f in job.fields) + ' |',
@@ -563,6 +578,35 @@ class PreparedMessage:
     job: Job
     mode: str
     payload: bytes | str
+    filename: str = ''
+
+
+def excel_filename(job: Job) -> str:
+    name = job.title + (f'_{job.route_value}' if job.route_value else '')
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:110] or '数据通知'
+    if name.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL',
+                                     *[f'COM{i}' for i in range(1, 10)],
+                                     *[f'LPT{i}' for i in range(1, 10)]}:
+        name = '_' + name
+    return f'{name}_{job.part}-{job.parts}.xlsx' if job.parts > 1 else f'{name}.xlsx'
+
+
+def excel_bytes(job: Job, highlight_conditions=None) -> bytes:
+    from services.excel_export import build_workbook
+
+    def format_value(field, value):
+        if is_rate_field(field):
+            rate = rate_number(value)
+            if rate is not None:
+                return rate / 100, '0.00%'
+        return value, None
+
+    data = build_workbook(job.fields, job.rows,
+                          (matches_conditions(row, highlight_conditions) for row in job.rows),
+                          format_value)
+    if len(data) > MAX_EXCEL_BYTES:
+        raise ValueError('Excel 附件超过 20 MB，需要拆分')
+    return data
 
 
 def _split_to_fit(job: Job, mode: str, warning_rate: float | None = None,
@@ -575,19 +619,21 @@ def _split_to_fit(job: Job, mode: str, warning_rate: float | None = None,
             payload = markdown_table(job, highlight_conditions)
             if len(payload.encode('utf-8')) > MAX_MARKDOWN_SAFE:
                 raise ValueError('Markdown 安全分页阈值')
+        elif mode == EXCEL_MODE:
+            payload = excel_bytes(job, highlight_conditions)
         else:
             raise ValueError('未知消息格式')
-        return [PreparedMessage(job, mode, payload)]
+        return [PreparedMessage(job, mode, payload, excel_filename(job) if mode == EXCEL_MODE else '')]
     except (ValueError, ImagePageOverflow):
         if len(job.rows) > 1:
             middle = len(job.rows) // 2
-            left = Job(job.title, job.fields, job.rows[:middle], job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
-            right = Job(job.title, job.fields, job.rows[middle:], job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            left = replace(job, rows=job.rows[:middle], part=1, parts=1)
+            right = replace(job, rows=job.rows[middle:], part=1, parts=1)
             return _split_to_fit(left, mode, warning_rate, highlight_conditions) + _split_to_fit(right, mode, warning_rate, highlight_conditions)
         if len(job.fields) > 1:
             middle = len(job.fields) // 2
-            left = Job(job.title, job.fields[:middle], job.rows, job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
-            right = Job(job.title, job.fields[middle:], job.rows, job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            left = replace(job, fields=job.fields[:middle], part=1, parts=1)
+            right = replace(job, fields=job.fields[middle:], part=1, parts=1)
             return _split_to_fit(left, mode, warning_rate, highlight_conditions) + _split_to_fit(right, mode, warning_rate, highlight_conditions)
         field = job.fields[0]
         raise ValueError(f'一条活动中的「{field}」内容单独成页仍超过推送限制，已取消本批发送；请检查该单元格内容') from None
@@ -607,10 +653,13 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
         original_counters = {id(m.job): (m.job.part, m.job.parts) for m in prepared}
         groups = defaultdict(list)
         for msg in prepared:
-            groups[(msg.job.store_code, msg.job.store_name, msg.job.group_field, msg.job.group_value)].append(msg)
+            groups[(msg.job.route_field, msg.job.route_value, msg.job.store_code,
+                    msg.job.store_name, msg.job.group_field, msg.job.group_value)].append(msg)
         for group in groups.values():
             for idx, msg in enumerate(group, 1):
                 msg.job.part, msg.job.parts = idx, len(group)
+                if mode == EXCEL_MODE:
+                    msg.filename = excel_filename(msg.job)
         final: list[PreparedMessage] = []
         split_again = False
         for msg in prepared:
@@ -619,7 +668,7 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
                 if original_counters[id(msg.job)] != (msg.job.part, msg.job.parts):
                     if mode == '图片表格':
                         msg.payload = image_bytes(render_table(msg.job, warning_rate, highlight_conditions))
-                    else:
+                    elif mode == 'Markdown表格':
                         msg.payload = markdown_table(msg.job, highlight_conditions)
                 final.append(msg)
             except (ImagePageOverflow, ValueError):
@@ -674,7 +723,9 @@ def read_mapping(path: str, kind: str) -> dict[str,str]:
 def check_webhook(url: str) -> str:
     url = url.strip()
     parsed = urlsplit(url)
-    if parsed.scheme != 'https' or parsed.hostname != 'qyapi.weixin.qq.com' or parsed.path != '/cgi-bin/webhook/send' or 'key=' not in (parsed.query or ''):
+    if (parsed.scheme != 'https' or parsed.hostname != 'qyapi.weixin.qq.com'
+            or parsed.path != '/cgi-bin/webhook/send'
+            or not parse_qs(parsed.query).get('key', [''])[0].strip()):
         raise ValueError('Webhook 必须为企业微信官方 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...')
     return url
 
@@ -702,10 +753,15 @@ def _safe_error(e: Exception, secrets: list[str]) -> str:
 
 def image_upload_form(data: bytes) -> tuple[dict[str, str], bytes]:
     """WeCom multipart upload with filename, MIME type, and filelength metadata."""
+    return media_upload_form(data, 'activity_report.jpg', 'image/jpeg')
+
+
+def media_upload_form(data: bytes, filename: str, content_type: str) -> tuple[dict[str, str], bytes]:
     boundary = 'wecom_' + uuid.uuid4().hex
+    filename = re.sub(r'["\\\r\n\x00]', '_', filename)
     head = (f'--{boundary}\r\n'
-            f'Content-Disposition: form-data; name="media"; filename="activity_report.jpg"; filelength={len(data)}\r\n'
-            f'Content-Type: image/jpeg\r\n\r\n').encode('ascii')
+            f'Content-Disposition: form-data; name="media"; filename="{filename}"; filelength={len(data)}\r\n'
+            f'Content-Type: {content_type}\r\n\r\n').encode('utf-8')
     body = head + data + f'\r\n--{boundary}--\r\n'.encode('ascii')
     return {'Content-Type': f'multipart/form-data; boundary={boundary}'}, body
 
@@ -762,12 +818,25 @@ class WeComSender:
                                                   'md5':hashlib.md5(b).hexdigest()}}
             elif mode == 'Markdown表格':
                 body = {'msgtype':'markdown_v2', 'markdown_v2':{'content':prepared.payload if prepared else markdown_table(job, highlight_conditions)}}
+            elif mode == EXCEL_MODE:
+                data = prepared.payload if prepared else excel_bytes(job, highlight_conditions)
+                if not isinstance(data, bytes) or not 5 < len(data) <= MAX_EXCEL_BYTES:
+                    raise ValueError('Excel 附件大小无效或超出 20 MB 限制')
+                headers, upload_data = media_upload_form(data,
+                    prepared.filename if prepared and prepared.filename else excel_filename(job),
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                upload = self._request('POST', 'https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media',
+                    params={'key': parse_qs(urlsplit(url).query)['key'][0], 'type': 'file'},
+                    data=upload_data, headers=headers)
+                if not upload.get('media_id'):
+                    raise RuntimeError('企业微信未返回文件 media_id，已停止发送该附件')
+                body = {'msgtype': 'file', 'file': {'media_id': upload['media_id']}}
             else:
                 raise ValueError('无效消息格式')
             return self._request('POST', url, json=body)
         user = recipient or self.touser
         if not user:
-            raise ValueError('请配置 UserID 或导入服务店映射表')
+            raise ValueError('请配置 UserID 或接收目标映射')
         if mode == '图片表格':
             b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate, highlight_conditions))
             upload_headers, upload_data = image_upload_form(b)
@@ -776,6 +845,20 @@ class WeComSender:
                                    data=upload_data, headers=upload_headers)
             body = {'touser':user, 'msgtype':'image', 'agentid':int(self.agentid),
                     'image':{'media_id':upload['media_id']}}
+        elif mode == EXCEL_MODE:
+            data = prepared.payload if prepared else excel_bytes(job, highlight_conditions)
+            if not isinstance(data, bytes) or not 5 < len(data) <= MAX_EXCEL_BYTES:
+                raise ValueError('Excel 附件大小无效或超出 20 MB 限制')
+            headers, upload_data = media_upload_form(data,
+                prepared.filename if prepared and prepared.filename else excel_filename(job),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            upload = self._request('POST', 'https://qyapi.weixin.qq.com/cgi-bin/media/upload',
+                params={'access_token': self.token(), 'type': 'file'},
+                data=upload_data, headers=headers)
+            if not upload.get('media_id'):
+                raise RuntimeError('企业微信未返回文件 media_id，已停止发送该附件')
+            body = {'touser': user, 'msgtype': 'file', 'agentid': int(self.agentid),
+                    'file': {'media_id': upload['media_id']}}
         else:
             # App push does not document markdown_v2; use plain text so columns never render as raw Markdown.
             raw = [job.title + (f'（{job.store_name}）' if job.store_name else '')]

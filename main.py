@@ -7,13 +7,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, QThreadPool, Qt, QTimer
 from PySide6.QtGui import QAction, QFont, QFontMetrics, QPixmap
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFormLayout, QGroupBox, QHeaderView, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QTabWidget, QTableView,
     QTextEdit, QVBoxLayout, QWidget)
 
-from engine import filter_records, number, read_excel, text_of, WeComSender
+from engine import EXCEL_MODE, filter_records, number, read_excel, text_of, WeComSender
 from services.notification_workflow import prepare_selection, validate_routes
 from ui.table_model import CheckboxDelegate, RecordTableModel
 from ui.filter_condition import FilterCondition
@@ -36,7 +36,7 @@ APP_NAME = '企业微信活动通知工具'
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f'{APP_NAME}  v3.0')
+        self.setWindowTitle(f'{APP_NAME}  v3.1')
         self.resize(1320, 860)
         self.setMinimumSize(1000, 680)
         self.setFont(QFont('Microsoft YaHei UI', 9))
@@ -110,12 +110,12 @@ class App(QMainWindow):
 
     def _build_data_page(self):
         layout = QVBoxLayout(self.data_page)
-        filter_box = QGroupBox('筛选条件（多条条件按 AND 同时生效）')
+        filter_box = QGroupBox()
+        filter_box.setToolTip('多条筛选条件按 AND 同时生效')
         filter_layout = QVBoxLayout(filter_box)
         self.filter_rows_layout = QVBoxLayout()
         self.filter_hint = QLabel('导入 Excel 或 CSV 后，可按任意实际列添加筛选条件。')
         self.filter_rows_layout.addWidget(self.filter_hint)
-        filter_layout.addLayout(self.filter_rows_layout)
         actions = QHBoxLayout()
         self.add_filter_button = QPushButton('添加条件')
         self.add_filter_button.setEnabled(False)
@@ -129,6 +129,7 @@ class App(QMainWindow):
         actions.addWidget(clear_button)
         actions.addStretch(1)
         filter_layout.addLayout(actions)
+        filter_layout.addLayout(self.filter_rows_layout)
         layout.addWidget(filter_box)
 
         tools = QHBoxLayout()
@@ -170,13 +171,11 @@ class App(QMainWindow):
 
     def _build_fields_page(self):
         layout = QVBoxLayout(self.fields_page)
-        layout.addWidget(QLabel('勾选要推送的 Excel 列；列表顺序就是消息中的列顺序。'))
-        area = QHBoxLayout()
         self.fields_list = QListWidget()
+        self.fields_list.setToolTip('勾选要推送的 Excel 列；可拖动或用上移、下移调整消息中的列顺序。')
         self.fields_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.fields_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
-        area.addWidget(self.fields_list, 1)
-        buttons = QVBoxLayout()
+        buttons = QHBoxLayout()
         for label, callback in (('上移 ↑', lambda: self.move_field(-1)),
                                 ('下移 ↓', lambda: self.move_field(1)),
                                 ('全部勾选', lambda: self.set_fields(True)),
@@ -185,11 +184,19 @@ class App(QMainWindow):
             button.clicked.connect(callback)
             buttons.addWidget(button)
         buttons.addStretch(1)
-        area.addLayout(buttons)
-        layout.addLayout(area, 1)
+        layout.addLayout(buttons)
+        layout.addWidget(self.fields_list, 1)
 
         settings = QGroupBox('通知内容设置')
-        form = QFormLayout(settings)
+        settings_layout = QVBoxLayout(settings)
+        preview_actions = QHBoxLayout()
+        preview_button = QPushButton('校验并预览消息')
+        preview_button.clicked.connect(self.preview)
+        preview_actions.addWidget(preview_button)
+        preview_actions.addStretch(1)
+        settings_layout.addLayout(preview_actions)
+        form = QFormLayout()
+        settings_layout.addLayout(form)
         saved_title = self.prefs.get('msg_title', '')
         if saved_title == '数据通知':
             saved_title = ''
@@ -199,26 +206,36 @@ class App(QMainWindow):
         form.addRow('通知标题 / 模板', self.title_edit)
         self.group_field_combo = QComboBox()
         self.group_field_combo.addItem('不分组', '')
-        self.group_field_combo.setToolTip('选择任意导入列作为分组依据；映射发送时仍会按服务店分开发送。')
+        self.group_field_combo.setToolTip('选择任意导入列作为内容分组依据；接收目标由映射匹配字段决定。')
         form.addRow('分组字段', self.group_field_combo)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(['图片表格', 'Markdown表格'])
+        self.mode_combo.addItems(['图片表格', 'Markdown表格', EXCEL_MODE])
         self.mode_combo.setCurrentText(self.prefs.get('mode', '图片表格'))
         form.addRow('发送格式', self.mode_combo)
-        preview_button = QPushButton('校验并预览消息')
-        preview_button.clicked.connect(self.preview)
-        form.addRow(preview_button)
+        self.include_excel_check = QCheckBox('同时附加 Excel 文件（当前勾选的记录与推送列）')
+        self.include_excel_check.setChecked(bool(self.prefs.get('include_excel', False)))
+        self.include_excel_check.setEnabled(self.mode_combo.currentText() != EXCEL_MODE)
+        self.mode_combo.currentTextChanged.connect(
+            lambda mode: self.include_excel_check.setEnabled(mode != EXCEL_MODE))
+        form.addRow(self.include_excel_check)
         layout.addWidget(settings)
 
-        highlight_box = QGroupBox('重点标注条件（可选，多条条件按 AND 生效）')
+        highlight_box = QGroupBox()
+        highlight_box.setToolTip('重点标注为可选项，多条条件按 AND 生效')
         highlight_layout = QVBoxLayout(highlight_box)
         self.highlight_rows_layout = QVBoxLayout()
         self.highlight_hint = QLabel('可按任意导入列设置文本或数值条件；符合条件的记录会在消息中标注。')
         self.highlight_rows_layout.addWidget(self.highlight_hint)
-        highlight_layout.addLayout(self.highlight_rows_layout)
+        highlight_actions = QHBoxLayout()
         add_highlight = QPushButton('添加标注条件')
         add_highlight.clicked.connect(self.add_highlight_condition)
-        highlight_layout.addWidget(add_highlight)
+        highlight_actions.addWidget(add_highlight)
+        clear_highlight = QPushButton('清除标注条件')
+        clear_highlight.clicked.connect(self.clear_highlight_conditions)
+        highlight_actions.addWidget(clear_highlight)
+        highlight_actions.addStretch(1)
+        highlight_layout.addLayout(highlight_actions)
+        highlight_layout.addLayout(self.highlight_rows_layout)
         layout.addWidget(highlight_box)
 
     def _build_send_page(self):
@@ -245,13 +262,18 @@ class App(QMainWindow):
         layout.addWidget(section)
         self._toggle_sender(self.kind_combo.currentText())
 
-        mapping = QGroupBox('服务店接收目标映射（可选）')
-        map_layout = QHBoxLayout(mapping)
-        map_layout.addWidget(QLabel('在软件内添加、编辑和保存接收目标；凭据使用系统凭据库。'))
-        map_layout.addStretch(1)
+        mapping = QGroupBox()
+        map_layout = QVBoxLayout(mapping)
+        map_actions = QHBoxLayout()
         map_button = QPushButton('管理映射…')
         map_button.clicked.connect(self.manage_mappings)
-        map_layout.addWidget(map_button)
+        map_actions.addWidget(map_button)
+        map_actions.addStretch(1)
+        map_layout.addLayout(map_actions)
+        self.mapping_summary = QLabel()
+        self.mapping_summary.setWordWrap(True)
+        map_layout.addWidget(self.mapping_summary)
+        self._update_mapping_summary()
         layout.addWidget(mapping)
 
         actions = QHBoxLayout()
@@ -284,6 +306,21 @@ class App(QMainWindow):
             form.setRowVisible(self.webhook_edit, bot)
             for widget in (self.corpid_edit, self.secret_edit, self.agentid_edit, self.touser_edit):
                 form.setRowVisible(widget, not bot)
+        if hasattr(self, 'mapping_summary'):
+            self._update_mapping_summary()
+
+    def _update_mapping_summary(self):
+        try:
+            settings = self.mapping_stores[self.kind_combo.currentText()].settings()
+            if settings['count']:
+                message = f'按“{settings["field"]}”匹配接收目标，已保存 {settings["count"]} 条映射。'
+                if self.fields and settings['field'] not in self.fields:
+                    message += ' 当前文件不包含此列，请在管理映射中更换匹配字段。'
+            else:
+                message = '尚未设置映射。可按任意 Excel 列的值分发到不同 Webhook 或 UserID。'
+        except (OSError, ValueError) as exc:
+            message = f'无法读取映射设置：{exc}'
+        self.mapping_summary.setText(message)
 
     def choose_excel(self):
         path, _ = QFileDialog.getOpenFileName(self, '选择 Excel 文件', '',
@@ -363,6 +400,7 @@ class App(QMainWindow):
         self.numeric_filter_fields = numeric_fields
         self._fill_field_list()
         self._fill_group_fields()
+        self._update_mapping_summary()
         self.clear_filter_conditions()
         self.clear_highlight_conditions()
         for condition in self.prefs.get('highlight_conditions', []):
@@ -627,7 +665,7 @@ class App(QMainWindow):
 
     def _snapshot(self):
         if not self.checked:
-            raise ValueError('请在第 1 页勾选至少一条活动记录')
+            raise ValueError('请在第 1 页勾选至少一条记录')
         fields = [self.fields_list.item(i).text() for i in range(self.fields_list.count())
                   if self.fields_list.item(i).checkState() == Qt.CheckState.Checked]
         if not fields:
@@ -640,10 +678,17 @@ class App(QMainWindow):
         title_template = self.title_edit.text().strip()
         if not title_template:
             title_template = '{group_value}通知' if group_field else '数据通知'
-        mapping_enabled = self.mapping_stores[self.kind_combo.currentText()].has_mappings()
+        try:
+            settings = self.mapping_stores[self.kind_combo.currentText()].settings()
+        except (OSError, ValueError) as exc:
+            raise ValueError(f'无法读取映射设置：{exc}') from exc
+        route_field = settings['field'] if settings['count'] else ''
+        if settings['count'] and (not route_field or route_field not in self.fields):
+            raise ValueError(f'当前文件缺少映射匹配列“{route_field}”，请在管理映射中更换匹配字段。')
         return {'ids': set(self.checked), 'fields': fields,
                 'mode': self.mode_combo.currentText(),
-                'group_field': group_field, 'route_by_store': mapping_enabled,
+                'include_excel': self.include_excel_check.isChecked() and self.mode_combo.currentText() != EXCEL_MODE,
+                'group_field': group_field, 'route_field': route_field,
                 'title': title_template, 'highlight_conditions': highlight_conditions,
                 'records': self.records}
 
@@ -656,18 +701,32 @@ class App(QMainWindow):
 
         def task(progress, cancel_event):
             messages = prepare_selection(snapshot)
-            return messages[0].payload, snapshot['mode'], len(messages)
+            attachments = [message for message in messages if message.mode == EXCEL_MODE]
+            return {'first': messages[0], 'attachment': attachments[0] if attachments else None,
+                    'files': len(attachments), 'total': len(messages)}
 
         self._run_task(task, self._show_preview, '正在后台校验并生成消息预览…',
                        error_title='无法预览')
 
     def _show_preview(self, result):
-        preview, mode, total = result
+        first = result['first']
+        preview, mode, total = first.payload, first.mode, result['total']
         dialog = QDialog(self)
         dialog.setWindowTitle(f'消息预览 - 自动拆分为 {total} 条消息')
         dialog.resize(1050, 740)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f'已逐条校验，预计 {total} 条消息。这里显示第一条；只有确认发送后才会推送。'))
+        actions = QHBoxLayout()
+        if mode == '图片表格':
+            save_image = QPushButton('保存当前 JPEG…')
+            save_image.clicked.connect(lambda: self._save_preview(dialog, preview))
+            actions.addWidget(save_image)
+        if result['attachment']:
+            save_excel = QPushButton('保存 Excel 附件样本…')
+            save_excel.clicked.connect(lambda: self._save_excel_preview(dialog, result['attachment']))
+            actions.addWidget(save_excel)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        layout.addWidget(QLabel(f'已校验 {total} 条消息（含 {result["files"]} 个 Excel 附件）。这里显示第一条，确认发送后才会推送。'))
         if mode == '图片表格':
             from PySide6.QtWidgets import QScrollArea
             scroll = QScrollArea()
@@ -679,9 +738,17 @@ class App(QMainWindow):
             label.setPixmap(pixmap)
             scroll.setWidget(label)
             layout.addWidget(scroll, 1)
-            save = QPushButton('保存与实际推送相同的 JPEG…')
-            save.clicked.connect(lambda: self._save_preview(dialog, preview))
-            layout.addWidget(save)
+        elif mode == EXCEL_MODE:
+            layout.addWidget(QLabel(f'{first.filename} · {len(preview) / 1024:.1f} KB · '
+                                    f'{len(first.job.rows)} 行 / {len(first.job.fields)} 列；下方预览前 100 行。'))
+            table = QTableView(dialog)
+            model = RecordTableModel(table)
+            model.set_content(first.job.fields, first.job.rows[:100])
+            table.setModel(model)
+            table.hideColumn(0)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            table.horizontalHeader().setDefaultSectionSize(150)
+            layout.addWidget(table, 1)
         else:
             text = QTextEdit()
             text.setReadOnly(True)
@@ -689,6 +756,19 @@ class App(QMainWindow):
             text.setPlainText(preview)
             layout.addWidget(text, 1)
         dialog.exec()
+
+    def _save_excel_preview(self, dialog, attachment):
+        path, _ = QFileDialog.getSaveFileName(dialog, '保存与实际发送相同的 Excel 附件',
+                                             attachment.filename, 'Excel 工作簿 (*.xlsx)')
+        if path:
+            if not path.lower().endswith('.xlsx'):
+                path += '.xlsx'
+            try:
+                Path(path).write_bytes(attachment.payload)
+            except OSError as exc:
+                QMessageBox.warning(dialog, '保存失败', str(exc))
+                return
+            QMessageBox.information(dialog, '已保存', path)
 
     def _save_preview(self, dialog, payload):
         path, _ = QFileDialog.getSaveFileName(dialog, '保存预览图片', '', 'JPEG 图片 (*.jpg)')
@@ -699,9 +779,19 @@ class App(QMainWindow):
             QMessageBox.information(dialog, '已保存', path)
 
     def manage_mappings(self):
-        dialog = MappingDialog(self.mapping_stores[self.kind_combo.currentText()], self.kind_combo.currentText(), self)
-        if dialog.exec():
-            self._log('服务店接收映射已保存。')
+        kind = self.kind_combo.currentText()
+        store = self.mapping_stores[kind]
+
+        def loaded(result):
+            rows, settings = result
+            dialog = MappingDialog(store, kind, self, fields=self.fields,
+                                   rows=rows, field=settings['field'])
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._update_mapping_summary()
+                self._log('接收目标映射已保存。')
+
+        self._run_task(lambda progress, cancel: (store.all(), store.settings()), loaded,
+                       '正在读取接收目标映射…', error_title='无法打开映射')
 
     def send_now(self):
         try:
@@ -712,7 +802,7 @@ class App(QMainWindow):
             options = {'kind': kind, 'webhook': self.webhook_edit.text(),
                        'corp': self.corpid_edit.text(), 'secret': self.secret_edit.text(),
                        'agent': self.agentid_edit.text(), 'user': self.touser_edit.text(),
-                       'mapping_enabled': self.mapping_stores[self.kind_combo.currentText()].has_mappings()}
+                       'mapping_enabled': bool(snapshot['route_field'])}
         except ValueError as exc:
             QMessageBox.warning(self, '发送配置', str(exc))
             return
@@ -720,6 +810,10 @@ class App(QMainWindow):
         def prepare(progress, cancel_event):
             prepared = prepare_selection(snapshot)
             mapping = self.mapping_stores[kind].as_dict() if options['mapping_enabled'] else {}
+            if options['mapping_enabled']:
+                settings = self.mapping_stores[kind].settings()
+                if not mapping or settings['field'] != snapshot['route_field']:
+                    raise ValueError('映射设置已变更，请重新校验并发送。')
             validate_routes([message.job for message in prepared], mapping, kind,
                             options['webhook'], options['user'])
             if kind == '自建应用消息' and not all((options['corp'].strip(),
@@ -734,15 +828,16 @@ class App(QMainWindow):
         prepared, mapping, options, highlight_conditions = plan
         kind = options['kind']
         mode = prepared[0].mode
-        recipients = len({mapping[item.job.store_code] for item in prepared}) if mapping else 1
+        recipients = len({mapping[item.job.route_value] for item in prepared}) if mapping else 1
         record_keys = {row['_id'] for item in prepared for row in item.job.rows}
-        shop_codes = {text_of(row.get('任务服务店编码'))
-                      for item in prepared for row in item.job.rows}
         confirm = (f'发送格式：{mode}（已完整校验）\n目标模式：{kind}\n'
-                   f'本次勾选活动记录：{len(record_keys)} 条\n预计发送消息：{len(prepared)} 条\n'
+                   f'本次勾选记录：{len(record_keys)} 条\n预计发送消息：{len(prepared)} 条\n'
+                   f'其中 Excel 附件：{sum(item.mode == EXCEL_MODE for item in prepared)} 个\n'
                    f'接收目标：{recipients} 个\n\n请确认接收对象正确。发送后不可撤回。')
-        if not mapping and len(shop_codes) > 1:
-            confirm += '\n\n注意：未设置接收映射，多家服务店的数据将发送到同一目标。'
+        if mapping:
+            confirm += f'\n\n映射匹配字段：{prepared[0].job.route_field}'
+        else:
+            confirm += '\n\n未设置映射，所选记录将发送到填写的同一接收目标。'
         answer = QMessageBox.warning(self, '正式发送前确认', confirm,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -765,11 +860,12 @@ class App(QMainWindow):
                         progress('操作已停止：后续未发送的消息已取消')
                         break
                     job = item.job
-                    recipient = mapping.get(job.store_code, '') if mapping else ''
+                    recipient = mapping[job.route_value] if mapping else ''
+                    label = job.group_value or job.route_value or '汇总'
                     try:
                         sender.send(item, mode, recipient, highlight_conditions=highlight_conditions)
                         ok += 1
-                        progress(f'[{index}/{len(prepared)}] 发送成功 · {job.store_name or "汇总"} · 第 {job.part}/{job.parts} 页')
+                        progress(f'[{index}/{len(prepared)}] {item.mode}发送成功 · {label} · 第 {job.part}/{job.parts} 页')
                     except Exception as exc:
                         failed += 1
                         error = str(exc)
@@ -777,7 +873,7 @@ class App(QMainWindow):
                                        recipient if kind == '群机器人Webhook' else ''):
                             if secret:
                                 error = error.replace(secret, '[已隐藏]')
-                        progress(f'[{index}/{len(prepared)}] 失败 · {job.store_name or "汇总"} · {error}')
+                        progress(f'[{index}/{len(prepared)}] 失败 · {label} · {error}')
                     if index < len(prepared) and kind == '群机器人Webhook':
                         self.stop_event.wait(3.2)
             except Exception as exc:
@@ -830,6 +926,7 @@ class App(QMainWindow):
                               for i in range(self.fields_list.count())],
                     'fields_confirmed': True,
                     'msg_title': self.title_edit.text(), 'mode': self.mode_combo.currentText(),
+                    'include_excel': self.include_excel_check.isChecked(),
                     'group_field': self.group_field_combo.currentData() or '',
                     'highlight_conditions': self._collect_highlight_conditions(strict=False),
                     'kind': self.kind_combo.currentText()}
