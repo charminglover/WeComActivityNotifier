@@ -7,9 +7,11 @@ from engine import check_webhook, make_jobs, prepare_messages
 def prepare_selection(snapshot: dict):
     selected_ids = set(snapshot['ids'])
     selected = [row for row in snapshot['records'] if row.get('_id') in selected_ids]
-    jobs = make_jobs(selected, snapshot['fields'], group_by_shop=snapshot['group'],
-                     page_size=12, columns_per_page=6, title=snapshot['title'])
-    return prepare_messages(jobs, snapshot['mode'], snapshot['warning'])
+    jobs = make_jobs(selected, snapshot['fields'], page_size=12, columns_per_page=6,
+                     title=snapshot['title'], group_by_field=snapshot.get('group_field', ''),
+                     route_by_store=snapshot.get('route_by_store', False))
+    return prepare_messages(jobs, snapshot['mode'],
+                            highlight_conditions=snapshot.get('highlight_conditions'))
 
 
 def validate_routes(jobs, mapping: dict[str, str], kind: str, webhook: str, user: str) -> None:

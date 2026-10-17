@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, QThreadPool, Qt, QTimer
 from PySide6.QtGui import QAction, QFont, QFontMetrics, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog,
     QFileDialog, QFormLayout, QGroupBox, QHeaderView, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QTabWidget, QTableView,
@@ -46,6 +46,7 @@ class App(QMainWindow):
         self.checked: set[str] = set()
         self.numeric_filter_fields: set[str] = set()
         self.filter_rows: list[FilterCondition] = []
+        self.highlight_rows: list[FilterCondition] = []
         self.filter_generation = 0
         self.selection_generation = 0
         self._fit_after_filter = False
@@ -189,22 +190,36 @@ class App(QMainWindow):
 
         settings = QGroupBox('通知内容设置')
         form = QFormLayout(settings)
-        self.title_edit = QLineEdit(self.prefs.get('msg_title', '数据通知'))
-        form.addRow('通知标题', self.title_edit)
+        saved_title = self.prefs.get('msg_title', '')
+        if saved_title == '数据通知':
+            saved_title = ''
+        self.title_edit = QLineEdit(saved_title)
+        self.title_edit.setPlaceholderText(
+            '留空时自动生成；可用 {group_field} 和 {group_value}，例如“{group_value}活动通知”')
+        form.addRow('通知标题 / 模板', self.title_edit)
+        self.group_field_combo = QComboBox()
+        self.group_field_combo.addItem('不分组', '')
+        self.group_field_combo.setToolTip('选择任意导入列作为分组依据；映射发送时仍会按服务店分开发送。')
+        form.addRow('分组字段', self.group_field_combo)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(['图片表格', 'Markdown表格'])
         self.mode_combo.setCurrentText(self.prefs.get('mode', '图片表格'))
         form.addRow('发送格式', self.mode_combo)
-        self.warning_edit = QLineEdit(str(self.prefs.get('warn_rate', 80)))
-        self.warning_edit.setMaximumWidth(160)
-        form.addRow('低完成率警示阈值 %', self.warning_edit)
-        self.group_check = QCheckBox('按服务店分别分组（可以配合接收目标映射表使用）')
-        self.group_check.setChecked(bool(self.prefs.get('group_by_shop', False)))
-        form.addRow(self.group_check)
         preview_button = QPushButton('校验并预览消息')
         preview_button.clicked.connect(self.preview)
         form.addRow(preview_button)
         layout.addWidget(settings)
+
+        highlight_box = QGroupBox('重点标注条件（可选，多条条件按 AND 生效）')
+        highlight_layout = QVBoxLayout(highlight_box)
+        self.highlight_rows_layout = QVBoxLayout()
+        self.highlight_hint = QLabel('可按任意导入列设置文本或数值条件；符合条件的记录会在消息中标注。')
+        self.highlight_rows_layout.addWidget(self.highlight_hint)
+        highlight_layout.addLayout(self.highlight_rows_layout)
+        add_highlight = QPushButton('添加标注条件')
+        add_highlight.clicked.connect(self.add_highlight_condition)
+        highlight_layout.addWidget(add_highlight)
+        layout.addWidget(highlight_box)
 
     def _build_send_page(self):
         layout = QVBoxLayout(self.send_page)
@@ -345,9 +360,13 @@ class App(QMainWindow):
         self.records = records
         self.filtered = []
         self.checked.clear()
-        self._fill_field_list()
         self.numeric_filter_fields = numeric_fields
+        self._fill_field_list()
+        self._fill_group_fields()
         self.clear_filter_conditions()
+        self.clear_highlight_conditions()
+        for condition in self.prefs.get('highlight_conditions', []):
+            self.add_highlight_condition(condition)
         self.add_filter_button.setEnabled(bool(fields))
         self.filter_hint.setText('已识别文件列，可添加任意列的筛选条件。')
         self.filter_hint.show()
@@ -363,10 +382,8 @@ class App(QMainWindow):
         self._log(f'导入成功：{len(records):,} 行，{len(fields)} 列。')
 
     def _fill_field_list(self):
-        saved = self.prefs.get('fields')
+        saved = self.prefs.get('fields') if self.prefs.get('fields_confirmed', False) else []
         saved_set = set(saved or [])
-        if not saved_set.intersection(self.fields):
-            saved_set = set(self.fields)
         order = [field for field in self.prefs.get('order', []) if field in self.fields]
         order.extend(field for field in self.fields if field not in order)
         self.fields_list.clear()
@@ -375,6 +392,64 @@ class App(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
             item.setCheckState(Qt.CheckState.Checked if field in saved_set else Qt.CheckState.Unchecked)
             self.fields_list.addItem(item)
+
+    def _fill_group_fields(self):
+        self.group_field_combo.blockSignals(True)
+        self.group_field_combo.clear()
+        self.group_field_combo.addItem('不分组', '')
+        # Store the field as item data: currentData() is used by snapshots and
+        # titles, while addItems() would leave it as None for every entry.
+        for field in self.fields:
+            self.group_field_combo.addItem(field, field)
+        selected = self.prefs.get('group_field', '')
+        if not selected and self.prefs.get('group_by_shop') and '任务服务店编码' in self.fields:
+            selected = '任务服务店编码'
+        index = self.group_field_combo.findData(selected)
+        self.group_field_combo.setCurrentIndex(max(0, index))
+        self.group_field_combo.blockSignals(False)
+
+    def add_highlight_condition(self, condition=None):
+        if not self.fields:
+            return
+        self.highlight_hint.hide()
+        row = FilterCondition(self.fields, self.numeric_filter_fields)
+        row.removed.connect(self._remove_highlight_condition)
+        self.highlight_rows_layout.addWidget(row)
+        self.highlight_rows.append(row)
+        if condition:
+            index = row.field.findText(condition.get('field', ''))
+            if index > 0:
+                row.field.setCurrentIndex(index)
+                row.operator.setCurrentText(condition.get('operator', ''))
+                row.value.setText(str(condition.get('value', '')))
+
+    def _remove_highlight_condition(self, row):
+        if row in self.highlight_rows:
+            self.highlight_rows.remove(row)
+        row.deleteLater()
+        if not self.highlight_rows:
+            self.highlight_hint.show()
+
+    def clear_highlight_conditions(self):
+        for row in self.highlight_rows:
+            self.highlight_rows_layout.removeWidget(row)
+            row.deleteLater()
+        self.highlight_rows.clear()
+        if hasattr(self, 'highlight_hint'):
+            self.highlight_hint.show()
+
+    def _collect_highlight_conditions(self, strict=True):
+        conditions = []
+        for row in self.highlight_rows:
+            try:
+                condition = row.condition()
+            except ValueError:
+                if strict:
+                    raise
+                continue
+            if condition:
+                conditions.append(condition)
+        return conditions
 
     def add_filter_condition(self):
         if not self.fields:
@@ -557,13 +632,19 @@ class App(QMainWindow):
                   if self.fields_list.item(i).checkState() == Qt.CheckState.Checked]
         if not fields:
             raise ValueError('请在第 2 页勾选至少一个推送字段')
-        warning = number(self.warning_edit.text())
-        if warning is None or not 0 <= warning <= 100:
-            raise ValueError('警示阈值必须是 0-100 之间的数字')
-        return {'ids': set(self.checked), 'fields': fields, 'warning': warning,
+        try:
+            highlight_conditions = self._collect_highlight_conditions()
+        except ValueError as exc:
+            raise ValueError('请检查重点标注条件：' + str(exc)) from exc
+        group_field = self.group_field_combo.currentData() or ''
+        title_template = self.title_edit.text().strip()
+        if not title_template:
+            title_template = '{group_value}通知' if group_field else '数据通知'
+        mapping_enabled = self.mapping_stores[self.kind_combo.currentText()].has_mappings()
+        return {'ids': set(self.checked), 'fields': fields,
                 'mode': self.mode_combo.currentText(),
-                'group': self.group_check.isChecked() or self.mapping_stores[self.kind_combo.currentText()].has_mappings(),
-                'title': self.title_edit.text().strip() or '售后活动执行进度通知',
+                'group_field': group_field, 'route_by_store': mapping_enabled,
+                'title': title_template, 'highlight_conditions': highlight_conditions,
                 'records': self.records}
 
     def preview(self):
@@ -644,13 +725,13 @@ class App(QMainWindow):
             if kind == '自建应用消息' and not all((options['corp'].strip(),
                     options['secret'].strip(), options['agent'].strip())):
                 raise ValueError('自建应用需要填写 CorpID、Secret、AgentID')
-            return prepared, mapping, options, snapshot['warning']
+            return prepared, mapping, options, snapshot['highlight_conditions']
 
         self._run_task(prepare, self._confirm_and_send,
                        '正在后台校验全部消息与接收目标…', error_title='发送配置')
 
     def _confirm_and_send(self, plan):
-        prepared, mapping, options, warning = plan
+        prepared, mapping, options, highlight_conditions = plan
         kind = options['kind']
         mode = prepared[0].mode
         recipients = len({mapping[item.job.store_code] for item in prepared}) if mapping else 1
@@ -686,7 +767,7 @@ class App(QMainWindow):
                     job = item.job
                     recipient = mapping.get(job.store_code, '') if mapping else ''
                     try:
-                        sender.send(item, mode, recipient, warning)
+                        sender.send(item, mode, recipient, highlight_conditions=highlight_conditions)
                         ok += 1
                         progress(f'[{index}/{len(prepared)}] 发送成功 · {job.store_name or "汇总"} · 第 {job.part}/{job.parts} 页')
                     except Exception as exc:
@@ -747,12 +828,13 @@ class App(QMainWindow):
                                if self.fields_list.item(i).checkState() == Qt.CheckState.Checked],
                     'order': [self.fields_list.item(i).text()
                               for i in range(self.fields_list.count())],
+                    'fields_confirmed': True,
                     'msg_title': self.title_edit.text(), 'mode': self.mode_combo.currentText(),
-                    'warn_rate': self.warning_edit.text(),
-                    'group_by_shop': self.group_check.isChecked(),
+                    'group_field': self.group_field_combo.currentData() or '',
+                    'highlight_conditions': self._collect_highlight_conditions(strict=False),
                     'kind': self.kind_combo.currentText()}
             self.config_store.save(data)
-        except OSError:
+        except (OSError, ValueError):
             pass
         event.accept()
 

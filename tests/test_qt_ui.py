@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QHeaderView, QTableView
 from ui.table_model import CheckboxDelegate
+from ui.mapping_dialog import MappingEntryDialog
 
 from main import FilterCondition, RecordTableModel
 
@@ -50,6 +51,9 @@ class TestQtTable(unittest.TestCase):
         self.assertEqual(model.data(index, Qt.ItemDataRole.CheckStateRole), Qt.CheckState.Checked)
         self.assertEqual(model.data(model.index(1, 0), Qt.ItemDataRole.CheckStateRole),
                          Qt.CheckState.Unchecked)
+        QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton,
+                         pos=table.visualRect(index).center())
+        self.assertEqual(model.checked, set(), '同一条记录再次点击应取消勾选')
         table.close()
 
     def test_generic_filter_row_and_interactive_column_width(self):
@@ -69,6 +73,19 @@ class TestQtTable(unittest.TestCase):
         self.assertEqual(table.horizontalHeader().sectionResizeMode(1),
                          QHeaderView.ResizeMode.Interactive)
         self.assertEqual(table.columnWidth(1), 240)
+
+    def test_mapping_entry_dialog_add_and_preserve_existing_target(self):
+        dialog = MappingEntryDialog('群机器人Webhook')
+        dialog.code.setText('REGION-NORTH')
+        dialog.target.setText('https://example.test/hook')
+        self.assertEqual(dialog.values(), {
+            'id': None, 'code': 'REGION-NORTH', 'target': 'https://example.test/hook'})
+
+        edited = MappingEntryDialog('群机器人Webhook', {
+            'id': 'saved-id', 'code': 'OLD', 'target': 'https://example.test/old'})
+        edited.code.setText('NEW')
+        self.assertEqual(edited.values(), {
+            'id': 'saved-id', 'code': 'NEW', 'target': 'https://example.test/old'})
 
 
 if __name__ == '__main__':

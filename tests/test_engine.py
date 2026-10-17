@@ -66,6 +66,21 @@ class TestCore(unittest.TestCase):
         self.assertEqual(len({(j.store_code,j.store_name) for j in jobs}),3)
         self.assertEqual((jobs[0].part,jobs[0].parts),(1,2))
 
+    def test_arbitrary_group_field_title_and_highlight(self):
+        rows = [
+            {'Region': 'North', 'Revenue': 1200, '_id': '1'},
+            {'Region': 'South', 'Revenue': 900, '_id': '2'},
+        ]
+        jobs = make_jobs(rows, ['Region', 'Revenue'], group_by_field='Region',
+                         title='{group_field}: {group_value}')
+        self.assertEqual([(job.group_field, job.group_value, job.title) for job in jobs], [
+            ('Region', 'North', 'Region: North'),
+            ('Region', 'South', 'Region: South'),
+        ])
+        condition = [{'field': 'Revenue', 'operator': '<', 'value': '1000'}]
+        self.assertIn('◆', markdown_table(jobs[1], condition))
+        self.assertNotIn('◆ South', markdown_table(jobs[0], condition))
+
     def test_markdown(self):
         jobs=make_jobs(self.records,['任务服务店名称','活动名称','任务执行率'])
         result=markdown_table(jobs[0])

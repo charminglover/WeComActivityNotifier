@@ -2,9 +2,54 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog, QHBoxLayout,
-    QInputDialog, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+from PySide6.QtWidgets import (QAbstractItemView, QDialog, QFileDialog, QFormLayout,
+    QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout)
+
+
+class MappingEntryDialog(QDialog):
+    def __init__(self, kind: str, current=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('编辑映射' if current else '添加映射')
+        self.resize(480, 150)
+        self.code = QLineEdit((current or {}).get('code', ''))
+        self.target = QLineEdit()
+        is_webhook = kind == '群机器人Webhook'
+        if is_webhook:
+            self.target.setEchoMode(QLineEdit.EchoMode.Password)
+            self.target.setPlaceholderText('输入 Webhook；编辑时留空表示保留原值')
+            target_label = 'Webhook URL'
+        else:
+            self.target.setPlaceholderText('多个 UserID 可用 | 分隔；留空表示保留原值')
+            target_label = 'UserID'
+        form = QFormLayout(self)
+        form.addRow('服务店编码', self.code)
+        form.addRow(target_label, self.target)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton('确定')
+        cancel = QPushButton('取消')
+        ok.clicked.connect(self._accept_if_valid)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        form.addRow(buttons)
+        self.current = current or {}
+
+    def _accept_if_valid(self):
+        try:
+            self.values()
+        except ValueError as exc:
+            QMessageBox.warning(self, '信息不完整', str(exc))
+            return
+        self.accept()
+
+    def values(self):
+        code = self.code.text().strip()
+        target = self.target.text().strip() or self.current.get('target', '')
+        if not code or not target:
+            raise ValueError('服务店编码和接收目标均不能为空。')
+        return {'id': self.current.get('id'), 'code': code, 'target': target}
 
 
 class MappingDialog(QDialog):
@@ -48,22 +93,14 @@ class MappingDialog(QDialog):
             self.table.setItem(index, 1, item)
 
     def _target_prompt(self, title, current=None):
-        code, ok = QInputDialog.getText(self, title, '服务店编码：', text=current.get('code', '') if current else '')
-        if not ok:
+        dialog = MappingEntryDialog(self.kind, current, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        is_webhook = self.kind == '群机器人Webhook'
-        target, ok = QInputDialog.getText(
-            self, title,
-            ('Webhook URL（留空表示保持现有凭据）' if is_webhook else 'UserID（多个用 | 分隔，留空表示保持现有凭据）'),
-            QInputDialog.EchoMode.Password if is_webhook else QInputDialog.EchoMode.Normal,
-            '')
-        if not ok:
+        try:
+            return dialog.values()
+        except ValueError as exc:
+            QMessageBox.warning(self, '信息不完整', str(exc))
             return None
-        target = target.strip() or (current or {}).get('target', '')
-        if not code.strip() or not target:
-            QMessageBox.warning(self, '信息不完整', '服务店编码和接收目标均不能为空。')
-            return None
-        return {'id': (current or {}).get('id'), 'code': code.strip(), 'target': target}
 
     def add_row(self):
         result = self._target_prompt('添加映射')

@@ -298,34 +298,44 @@ class Job:
     store_name: str = ''
     part: int = 1
     parts: int = 1
+    group_field: str = ''
+    group_value: str = ''
 
 
 def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = False,
-              page_size: int = 8, columns_per_page: int = 7, title: str = '数据通知') -> list[Job]:
+              page_size: int = 8, columns_per_page: int = 7, title: str = '数据通知',
+              group_by_field: str = '', route_by_store: bool = False) -> list[Job]:
+    """Build message pages, optionally grouped by any imported column.
+
+    ``group_by_shop`` is retained for callers of earlier versions. Store routing
+    can be kept separate from the displayed grouping when per-store mappings exist.
+    """
     if not records or not fields:
         raise ValueError('需要至少选择一条活动记录和一项推送字段')
+    if group_by_shop and not group_by_field:
+        group_by_field = KEY_STORE
+        route_by_store = True
     page_size = max(1, min(30, int(page_size)))
     columns_per_page = max(2, min(10, int(columns_per_page)))
     groups = defaultdict(list)
-    if group_by_shop:
-        for row in records:
-            code = text_of(row.get(KEY_STORE))
-            # Use name to avoid incorrectly mixing stores if code is empty.
-            name = text_of(row.get(NAME_STORE))
-            groups[(code, name)].append(row)
-    else:
-        groups[('', '')] = records
+    for row in records:
+        code = text_of(row.get(KEY_STORE)) if route_by_store else ''
+        name = text_of(row.get(NAME_STORE)) if route_by_store else ''
+        group_value = text_of(row.get(group_by_field), group_by_field) if group_by_field else ''
+        groups[(code, name, group_value)].append(row)
     jobs = []
-    for (code, name), entries in groups.items():
+    for (code, name, group_value), entries in groups.items():
         row_parts = [entries[i:i+page_size] for i in range(0, len(entries), page_size)]
         field_parts = [fields[i:i+columns_per_page] for i in range(0, len(fields), columns_per_page)]
         part_total = len(row_parts) * len(field_parts)
+        group_title = title.replace('{group_field}', group_by_field).replace('{group_value}', group_value)
+        start = len(jobs)
         for rowpart in row_parts:
             for fieldpart in field_parts:
-                jobs.append(Job(title=title, fields=fieldpart, rows=rowpart, store_code=code,
-                                store_name=name, part=len(jobs) + 1 if not group_by_shop else 1, parts=part_total))
-        # Correct 1-based numbering within each group.
-        for idx, job in enumerate(jobs[-part_total:], 1):
+                jobs.append(Job(title=group_title, fields=fieldpart, rows=rowpart, store_code=code,
+                                store_name=name, parts=part_total, group_field=group_by_field,
+                                group_value=group_value))
+        for idx, job in enumerate(jobs[start:], 1):
             job.part = idx
     return jobs
 
@@ -411,7 +421,36 @@ class ImagePageOverflow(ValueError):
     """Page needs to be split before allocating a large bitmap."""
 
 
-def render_table(job: Job, warning_rate: float = 80) -> Image.Image:
+def condition_matches(row: dict, condition: dict) -> bool:
+    field = str(condition.get('field') or '')
+    op = str(condition.get('operator') or '')
+    expected = str(condition.get('value') or '').strip()
+    raw = row.get(field)
+    actual_text = text_of(raw, field).strip()
+    if op == '为空':
+        return not actual_text
+    if op == '不为空':
+        return bool(actual_text)
+    if op in ('包含', '不包含', '等于', '不等于'):
+        actual, target = actual_text.casefold(), expected.casefold()
+        return (target in actual if op == '包含' else target not in actual if op == '不包含'
+                else actual == target if op == '等于' else actual != target)
+    if op in ('<', '<=', '=', '!=', '>=', '>'):
+        left = rate_number(raw) if is_rate_field(field) else number(raw)
+        right = rate_number(expected) if is_rate_field(field) else number(expected)
+        if left is None or right is None:
+            return False
+        return {'<': left < right, '<=': left <= right, '=': left == right,
+                '!=': left != right, '>=': left >= right, '>': left > right}[op]
+    return False
+
+
+def matches_conditions(row: dict, conditions: list[dict] | None) -> bool:
+    return bool(conditions) and all(condition_matches(row, condition) for condition in conditions)
+
+
+def render_table(job: Job, warning_rate: float | None = None,
+                 highlight_conditions: list[dict] | None = None) -> Image.Image:
     from PIL import Image, ImageDraw
 
     columns = job.fields
@@ -439,7 +478,10 @@ def render_table(job: Job, warning_rate: float = 80) -> Image.Image:
     canvas = Image.new('RGB', (full_width, total_height), 'white')
     d = ImageDraw.Draw(canvas)
     d.text((36, 28), job.title, fill='#202020', font=titlefont)
-    subtitle = f'{job.store_name}  ' if job.store_name else ''
+    if job.group_field:
+        subtitle = f'按{job.group_field}：{job.group_value}  ·  '
+    else:
+        subtitle = f'{job.store_name}  ' if job.store_name else ''
     subtitle += f'共 {len(job.rows)} 条活动  ·  第 {job.part}/{job.parts} 页'
     d.text((36, 82), _trim(d, subtitle, small, full_width - 72), fill='#666666', font=small)
     y = 122
@@ -454,7 +496,9 @@ def render_table(job: Job, warning_rate: float = 80) -> Image.Image:
         x = 36
         for ci, (width, lines) in enumerate(zip(widths, lines_by_col)):
             shade = '#FFFFFF' if idx % 2 else '#F8F9FB'
-            if ci > 0 and is_rate_field(columns[ci - 1]):
+            if matches_conditions(row, highlight_conditions):
+                shade = '#FFF0CC'
+            elif warning_rate is not None and ci > 0 and is_rate_field(columns[ci - 1]):
                 rate = rate_number(row.get(columns[ci - 1]))
                 if rate is not None and rate < warning_rate:
                     shade = '#FCECEA'
@@ -463,7 +507,10 @@ def render_table(job: Job, warning_rate: float = 80) -> Image.Image:
                 d.text((x + 10, y + 12 + n * 28), line, fill='#202020', font=face)
             x += width
         y += row_height
-    d.text((36, y + 20), '低于警示阈值的完成率以浅红色标识', fill='#707070', font=small)
+    if highlight_conditions:
+        d.text((36, y + 20), '浅黄色记录符合设置的重点标注条件', fill='#707070', font=small)
+    elif warning_rate is not None:
+        d.text((36, y + 20), f'低于 {warning_rate:g}% 的完成率以浅红色标识', fill='#707070', font=small)
     return canvas
 
 
@@ -489,14 +536,21 @@ def image_bytes(image: Image.Image) -> bytes:
     raise ImagePageOverflow('单页图片即使压缩仍超出 2 MB，需要自动分页')
 
 
-def markdown_table(job: Job) -> str:
+def markdown_table(job: Job, highlight_conditions: list[dict] | None = None) -> str:
     def esc(s):
         return str(s).replace('|','\\|').replace('\n', ' ').replace('\r',' ').replace('`', '\\`')
-    lines = [f'## {esc(job.title)}', f'> {esc(job.store_name) + " · " if job.store_name else ""}共 {len(job.rows)} 条 · 第 {job.part}/{job.parts} 页',
+    subtitle = (f'按{job.group_field}：{job.group_value} · ' if job.group_field else
+                f'{job.store_name} · ' if job.store_name else '')
+    lines = [f'## {esc(job.title)}', f'> {esc(subtitle)}共 {len(job.rows)} 条 · 第 {job.part}/{job.parts} 页',
              '', '| ' + ' | '.join(esc(f) for f in job.fields) + ' |',
              '| ' + ' | '.join('---' for _ in job.fields) + ' |']
+    if highlight_conditions:
+        lines.insert(2, '> 标记 ◆ 的记录符合重点标注条件')
     for r in job.rows:
-        lines.append('| ' + ' | '.join(esc(text_of(r.get(f), f)) for f in job.fields) + ' |')
+        values = [text_of(r.get(f), f) for f in job.fields]
+        if values and matches_conditions(r, highlight_conditions):
+            values[0] = '◆ ' + values[0]
+        lines.append('| ' + ' | '.join(esc(value) for value in values) + ' |')
     result = '\n'.join(lines)
     if len(result.encode('utf8')) > MAX_ROBOT_BYTES:
         raise ValueError('Markdown 消息超出 4096 字节，请减小每页行数或列数，或使用图片模式')
@@ -511,13 +565,14 @@ class PreparedMessage:
     payload: bytes | str
 
 
-def _split_to_fit(job: Job, mode: str, warning_rate: float):
+def _split_to_fit(job: Job, mode: str, warning_rate: float | None = None,
+                  highlight_conditions: list[dict] | None = None):
     """Pack by actual serialized bytes rather than estimated rows/columns."""
     try:
         if mode == '图片表格':
-            payload = image_bytes(render_table(job, warning_rate))
+            payload = image_bytes(render_table(job, warning_rate, highlight_conditions))
         elif mode == 'Markdown表格':
-            payload = markdown_table(job)
+            payload = markdown_table(job, highlight_conditions)
             if len(payload.encode('utf-8')) > MAX_MARKDOWN_SAFE:
                 raise ValueError('Markdown 安全分页阈值')
         else:
@@ -526,24 +581,24 @@ def _split_to_fit(job: Job, mode: str, warning_rate: float):
     except (ValueError, ImagePageOverflow):
         if len(job.rows) > 1:
             middle = len(job.rows) // 2
-            left = Job(job.title, job.fields, job.rows[:middle], job.store_code, job.store_name)
-            right = Job(job.title, job.fields, job.rows[middle:], job.store_code, job.store_name)
-            return _split_to_fit(left, mode, warning_rate) + _split_to_fit(right, mode, warning_rate)
+            left = Job(job.title, job.fields, job.rows[:middle], job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            right = Job(job.title, job.fields, job.rows[middle:], job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            return _split_to_fit(left, mode, warning_rate, highlight_conditions) + _split_to_fit(right, mode, warning_rate, highlight_conditions)
         if len(job.fields) > 1:
             middle = len(job.fields) // 2
-            left = Job(job.title, job.fields[:middle], job.rows, job.store_code, job.store_name)
-            right = Job(job.title, job.fields[middle:], job.rows, job.store_code, job.store_name)
-            return _split_to_fit(left, mode, warning_rate) + _split_to_fit(right, mode, warning_rate)
+            left = Job(job.title, job.fields[:middle], job.rows, job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            right = Job(job.title, job.fields[middle:], job.rows, job.store_code, job.store_name, group_field=job.group_field, group_value=job.group_value)
+            return _split_to_fit(left, mode, warning_rate, highlight_conditions) + _split_to_fit(right, mode, warning_rate, highlight_conditions)
         field = job.fields[0]
         raise ValueError(f'一条活动中的「{field}」内容单独成页仍超过推送限制，已取消本批发送；请检查该单元格内容') from None
 
 
-def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: float = 80,
-                     max_messages: int = 500) -> list[PreparedMessage]:
+def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: float | None = None,
+                     max_messages: int = 500, highlight_conditions: list[dict] | None = None) -> list[PreparedMessage]:
     """Safely render/validate the entire batch BEFORE confirming any network send."""
     prepared: list[PreparedMessage] = []
     for job in jobs:
-        prepared.extend(_split_to_fit(job, mode, warning_rate))
+        prepared.extend(_split_to_fit(job, mode, warning_rate, highlight_conditions))
         if len(prepared) > max_messages:
             raise ValueError(f'本批超过 {max_messages} 条消息，已取消预处理；请缩小筛选范围')
     # Page counters change after a split; validate again using the final counters.
@@ -552,7 +607,7 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
         original_counters = {id(m.job): (m.job.part, m.job.parts) for m in prepared}
         groups = defaultdict(list)
         for msg in prepared:
-            groups[(msg.job.store_code, msg.job.store_name)].append(msg)
+            groups[(msg.job.store_code, msg.job.store_name, msg.job.group_field, msg.job.group_value)].append(msg)
         for group in groups.values():
             for idx, msg in enumerate(group, 1):
                 msg.job.part, msg.job.parts = idx, len(group)
@@ -563,12 +618,12 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
                 # Avoid duplicate image encoding when make_jobs' counters were already correct.
                 if original_counters[id(msg.job)] != (msg.job.part, msg.job.parts):
                     if mode == '图片表格':
-                        msg.payload = image_bytes(render_table(msg.job, warning_rate))
+                        msg.payload = image_bytes(render_table(msg.job, warning_rate, highlight_conditions))
                     else:
-                        msg.payload = markdown_table(msg.job)
+                        msg.payload = markdown_table(msg.job, highlight_conditions)
                 final.append(msg)
             except (ImagePageOverflow, ValueError):
-                replacement = _split_to_fit(msg.job, mode, warning_rate)
+                replacement = _split_to_fit(msg.job, mode, warning_rate, highlight_conditions)
                 if len(replacement) == 1:
                     raise ValueError('页码变化造成单页超限；该活动字段无法进一步拆分') from None
                 final.extend(replacement)
@@ -694,18 +749,19 @@ class WeComSender:
                 raise RuntimeError('无法获取企业微信 access_token')
         return self._token
 
-    def send(self, job: Job | PreparedMessage, mode: str, recipient: str = '', warning_rate: float = 80):
+    def send(self, job: Job | PreparedMessage, mode: str, recipient: str = '', warning_rate: float | None = None,
+             highlight_conditions: list[dict] | None = None):
         prepared = job if isinstance(job, PreparedMessage) else None
         if prepared:
             job, mode = prepared.job, prepared.mode
         if self.kind == '群机器人Webhook':
             url = check_webhook(recipient or self.webhook)
             if mode == '图片表格':
-                b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate))
+                b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate, highlight_conditions))
                 body = {'msgtype':'image', 'image':{'base64':base64.b64encode(b).decode('ascii'),
                                                   'md5':hashlib.md5(b).hexdigest()}}
             elif mode == 'Markdown表格':
-                body = {'msgtype':'markdown_v2', 'markdown_v2':{'content':prepared.payload if prepared else markdown_table(job)}}
+                body = {'msgtype':'markdown_v2', 'markdown_v2':{'content':prepared.payload if prepared else markdown_table(job, highlight_conditions)}}
             else:
                 raise ValueError('无效消息格式')
             return self._request('POST', url, json=body)
@@ -713,7 +769,7 @@ class WeComSender:
         if not user:
             raise ValueError('请配置 UserID 或导入服务店映射表')
         if mode == '图片表格':
-            b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate))
+            b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate, highlight_conditions))
             upload_headers, upload_data = image_upload_form(b)
             upload = self._request('POST', 'https://qyapi.weixin.qq.com/cgi-bin/media/upload',
                                    params={'access_token':self.token(), 'type':'image'},

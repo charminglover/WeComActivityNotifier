@@ -1,7 +1,8 @@
 """Virtualized Qt table model for source records."""
 from __future__ import annotations
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal, QEvent
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent
+from PySide6.QtWidgets import QStyledItemDelegate
 from engine import text_of
 
 class RecordTableModel(QAbstractTableModel):
@@ -59,7 +60,7 @@ class RecordTableModel(QAbstractTableModel):
                 role != Qt.ItemDataRole.CheckStateRole):
             return False
         key = self.rows[index.row()].get('_id')
-        checked_value = value == Qt.CheckState.Checked or value == int(Qt.CheckState.Checked)
+        checked_value = value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value
         if checked_value:
             self.checked.add(key)
         else:
@@ -88,13 +89,9 @@ class RecordTableModel(QAbstractTableModel):
                                        Qt.ItemDataRole.BackgroundRole])
         self.checkedChanged.emit()
 
-from PySide6.QtCore import QEvent
-from PySide6.QtGui import QKeyEvent, QMouseEvent
-from PySide6.QtWidgets import QStyledItemDelegate
-
 
 class CheckboxDelegate(QStyledItemDelegate):
-    """Make the whole checkbox cell reliably toggle, independent of tiny indicator hitboxes."""
+    """Toggle the full checkbox cell on one click, with normal keyboard support."""
     def editorEvent(self, event, model, option, index):
         if not index.isValid() or index.column() != 0:
             return super().editorEvent(event, model, option, index)
