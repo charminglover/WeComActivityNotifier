@@ -12,7 +12,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from engine import (DEFAULT_FIELDS, read_excel, filter_records, text_of, number, rate_number,
+from engine import (read_excel, filter_records, text_of, number,
                     make_jobs, prepare_messages, read_mapping, WeComSender, check_webhook)
 
 APP_NAME = '企业微信活动通知工具'
@@ -76,15 +76,9 @@ class App(tk.Tk):
     def _init_vars(self):
         p = self.prefs
         self.file_var = tk.StringVar()
-        self.shop_var = tk.StringVar()
-        self.act_var = tk.StringVar()
-        self.status_var = tk.StringVar(value='全部')
-        self.metric_var = tk.StringVar()
-        self.comp_var = tk.StringVar(value='<')
-        self.threshold_var = tk.StringVar()
-        self.qty_metric = tk.StringVar()
-        self.qty_comp = tk.StringVar(value='>')
-        self.qty_threshold = tk.StringVar()
+        self.filter_fields = []
+        self.numeric_filter_fields = set()
+        self.filter_condition_rows = []
         self.msg_title = tk.StringVar(value=p.get('msg_title','数据通知'))
         self.mode_var = tk.StringVar(value=p.get('mode','图片表格'))
         self.page_var = tk.StringVar(value=str(p.get('page_size',12)))
@@ -128,36 +122,19 @@ class App(tk.Tk):
         self.bar.pack(side='right')
 
     def _data_tab(self):
-        filters = ttk.LabelFrame(self.page_data,text='筛选条件（同一行的条件按 AND 同时生效）',padding=10)
+        filters = ttk.LabelFrame(self.page_data,text='筛选条件（多条条件按 AND 同时生效）',padding=10)
         filters.pack(fill='x')
-        for i in range(12):
-            filters.columnconfigure(i,weight=1 if i in (1,4) else 0)
-        ttk.Label(filters,text='关键词 1（搜索全部列）').grid(row=0,column=0,sticky='w')
-        ttk.Entry(filters,textvariable=self.shop_var,width=23).grid(row=0,column=1,sticky='ew',padx=(4,15))
-        ttk.Label(filters,text='关键词 2（搜索全部列）').grid(row=0,column=2,sticky='w')
-        ttk.Entry(filters,textvariable=self.act_var,width=24).grid(row=0,column=3,sticky='ew',padx=(4,15))
-        self.status_label=ttk.Label(filters,text='状态筛选（可选）')
-        self.status_label.grid(row=0,column=4,sticky='w')
-        self.status_select=ttk.Combobox(filters,textvariable=self.status_var,values=['全部'],state='readonly',width=13)
-        self.status_select.grid(row=0,column=5,sticky='w',padx=(4,15))
-        ttk.Button(filters,text='执行筛选',command=self.apply_filters).grid(row=0,column=6,padx=5)
-        ttk.Button(filters,text='清除条件',command=self.clear_filters).grid(row=0,column=7,padx=5)
-        ttk.Label(filters,text='数值条件 1').grid(row=1,column=0,sticky='w',pady=(10,0))
-        self.metric_select=ttk.Combobox(filters,textvariable=self.metric_var,width=20,state='readonly')
-        self.metric_select.grid(row=1,column=1,sticky='w',pady=(10,0))
-        self.comp_select=ttk.Combobox(filters,textvariable=self.comp_var,values=['<','<=','=','>=','>'],width=4,state='readonly')
-        self.comp_select.grid(row=1,column=2,sticky='e',pady=(10,0))
-        self.threshold_entry=ttk.Entry(filters,textvariable=self.threshold_var,width=8)
-        self.threshold_entry.grid(row=1,column=3,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='（对数字列进行筛选）').grid(row=1,column=4,columnspan=2,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='数值条件 2').grid(row=2,column=0,sticky='w',pady=(10,0))
-        self.qty_select=ttk.Combobox(filters,textvariable=self.qty_metric,width=20,state='readonly')
-        self.qty_select.grid(row=2,column=1,sticky='w',pady=(10,0))
-        self.qty_comp_select=ttk.Combobox(filters,textvariable=self.qty_comp,values=['<','<=','=','>=','>'],width=4,state='readonly')
-        self.qty_comp_select.grid(row=2,column=2,sticky='e',pady=(10,0))
-        self.qty_threshold_entry=ttk.Entry(filters,textvariable=self.qty_threshold,width=8)
-        self.qty_threshold_entry.grid(row=2,column=3,sticky='w',pady=(10,0))
-        ttk.Label(filters,text='（可再选一个数字列）').grid(row=2,column=4,columnspan=2,sticky='w',pady=(10,0))
+        self.filter_rows_frame = ttk.Frame(filters)
+        self.filter_rows_frame.pack(fill='x')
+        self.filter_empty_label = ttk.Label(
+            self.filter_rows_frame, text='导入 Excel 或 CSV 后，可按任意实际列添加筛选条件。')
+        self.filter_empty_label.pack(anchor='w')
+        actions = ttk.Frame(filters)
+        actions.pack(fill='x',pady=(8,0))
+        self.add_filter_button = ttk.Button(actions,text='添加条件',command=self._add_filter_condition,state='disabled')
+        self.add_filter_button.pack(side='left')
+        ttk.Button(actions,text='执行筛选',command=self.apply_filters).pack(side='left',padx=5)
+        ttk.Button(actions,text='清除条件',command=self.clear_filters).pack(side='left')
         tools=ttk.Frame(self.page_data)
         tools.pack(fill='x',pady=(10,6))
         ttk.Button(tools,text='勾选当前筛选结果',command=lambda:self.select_filtered('all')).pack(side='left',padx=(0,5))
@@ -214,7 +191,6 @@ class App(tk.Tk):
         ttk.Button(cmd,text='上移 ↑',command=lambda:self.move_field(-1)).pack(fill='x',pady=3)
         ttk.Button(cmd,text='下移 ↓',command=lambda:self.move_field(1)).pack(fill='x',pady=3)
         ttk.Separator(cmd).pack(fill='x',pady=10)
-        ttk.Button(cmd,text='推荐字段',command=lambda:self.set_fields('recommended')).pack(fill='x',pady=3)
         ttk.Button(cmd,text='全部勾选',command=lambda:self.set_fields('all')).pack(fill='x',pady=3)
         ttk.Button(cmd,text='全部清空',command=lambda:self.set_fields('none')).pack(fill='x',pady=3)
         settings=ttk.LabelFrame(self.page_fields,text='通知内容设置',padding=10)
@@ -361,34 +337,83 @@ class App(tk.Tk):
         self.table_placeholder.place_forget()
 
     def _configure_filter_fields(self, fields, records):
-        if '活动状态' in fields:
-            values=sorted({text_of(r.get('活动状态')) for r in records if text_of(r.get('活动状态'))})
-            self.status_select.configure(values=['全部']+values,state='readonly')
-            self.status_label.configure(text='状态筛选')
-        else:
-            self.status_var.set('全部')
-            self.status_select.configure(values=['全部'],state='disabled')
-            self.status_label.configure(text='状态筛选（无此列）')
-
+        self._clear_filter_conditions()
+        self.filter_fields=list(fields)
         sample=records[:500]
-        numeric_fields=[f for f in fields if any(number(r.get(f)) is not None for r in sample)]
-        for selector,variable,operator,entry in (
-            (self.metric_select,self.metric_var,self.comp_select,self.threshold_entry),
-            (self.qty_select,self.qty_metric,self.qty_comp_select,self.qty_threshold_entry),
-        ):
-            selector.configure(values=numeric_fields,state='readonly' if numeric_fields else 'disabled')
-            if variable.get() not in numeric_fields:
-                variable.set(numeric_fields[0] if numeric_fields else '')
-            operator.configure(state='readonly' if numeric_fields else 'disabled')
-            entry.configure(state='normal' if numeric_fields else 'disabled')
+        self.numeric_filter_fields={
+            field for field in fields
+            if any(number(record.get(field)) is not None for record in sample)
+        }
+        self.filter_empty_label.configure(text='已识别文件列，可添加任意列的筛选条件。')
+        self.filter_empty_label.pack(anchor='w')
+        self.add_filter_button.configure(state='normal' if fields else 'disabled')
+
+    def _clear_filter_conditions(self):
+        for row in getattr(self, 'filter_condition_rows', []):
+            row['frame'].destroy()
+        self.filter_condition_rows=[]
+
+    def _add_filter_condition(self):
+        if not self.filter_fields:
+            return
+        if not self.filter_condition_rows:
+            self.filter_empty_label.pack_forget()
+        frame=ttk.Frame(self.filter_rows_frame)
+        frame.pack(fill='x',pady=2)
+        field_var=tk.StringVar()
+        operator_var=tk.StringVar()
+        value_var=tk.StringVar()
+        field_select=ttk.Combobox(frame,textvariable=field_var,values=self.filter_fields,
+                                  state='readonly',width=24)
+        field_select.pack(side='left',padx=(0,6))
+        operator_select=ttk.Combobox(frame,textvariable=operator_var,values=[],
+                                     state='disabled',width=12)
+        operator_select.pack(side='left',padx=(0,6))
+        value_entry=ttk.Entry(frame,textvariable=value_var,width=28,state='disabled')
+        value_entry.pack(side='left',padx=(0,6))
+        row={'frame':frame,'field_var':field_var,'operator_var':operator_var,
+             'value_var':value_var,'operator_select':operator_select,'value_entry':value_entry}
+        self.filter_condition_rows.append(row)
+        field_select.bind('<<ComboboxSelected>>',lambda event,r=row:self._update_filter_operator(r))
+        operator_select.bind('<<ComboboxSelected>>',lambda event,r=row:self._update_filter_value(r))
+        ttk.Button(frame,text='删除',command=lambda r=row:self._remove_filter_condition(r)).pack(side='left')
+
+    def _update_filter_operator(self, row):
+        row['operator_var'].set('')
+        row['value_var'].set('')
+        field=row['field_var'].get()
+        if not field:
+            row['operator_select'].configure(values=[],state='disabled')
+            row['value_entry'].configure(state='disabled')
+            return
+        if field in self.numeric_filter_fields:
+            operators=['<','<=','=','!=','>=','>','为空','不为空']
+        else:
+            operators=['包含','不包含','等于','不等于','为空','不为空']
+        row['operator_select'].configure(values=operators,state='readonly')
+        row['value_entry'].configure(state='normal')
+
+    def _update_filter_value(self, row):
+        if row['operator_var'].get() in ('为空','不为空'):
+            row['value_var'].set('')
+            row['value_entry'].configure(state='disabled')
+        else:
+            row['value_entry'].configure(state='normal')
+
+    def _remove_filter_condition(self, row):
+        row['frame'].destroy()
+        if row in self.filter_condition_rows:
+            self.filter_condition_rows.remove(row)
+        if not self.filter_condition_rows:
+            self.filter_empty_label.configure(text='已识别文件列，可添加任意列的筛选条件。')
+            self.filter_empty_label.pack(anchor='w')
 
     def _fill_fields(self):
         if not self._checkbox_images:
             self._checkbox_images = self._create_checkbox_images()
         saved=self.prefs.get('fields')
         if saved is None or (saved and not set(saved).intersection(self.fields)):
-            recommended=[f for f in self.fields if f in DEFAULT_FIELDS]
-            last=set(recommended or self.fields[:8])
+            last=set(self.fields)
         else:
             last=set(saved)
         preferred=[x for x in self.prefs.get('order',[]) if x in self.fields]
@@ -437,28 +462,38 @@ class App(tk.Tk):
         self._refresh_fields(nextindex)
 
     def set_fields(self, mode):
-        recommended=[f for f in self.fields if f in DEFAULT_FIELDS] or self.fields[:8]
         for f in self.fields:
-            self.field_flags[f]=mode=='all' or (mode=='recommended' and f in recommended)
+            self.field_flags[f]=mode=='all'
         self._refresh_fields()
 
     def clear_filters(self):
-        self.shop_var.set(''); self.act_var.set('');self.status_var.set('全部')
-        self.threshold_var.set('');self.qty_threshold.set('')
+        self._clear_filter_conditions()
+        self.filter_empty_label.configure(
+            text='已识别文件列，可添加任意列的筛选条件。' if self.filter_fields
+            else '导入 Excel 或 CSV 后，可按任意实际列添加筛选条件。')
+        self.filter_empty_label.pack(anchor='w')
         self.apply_filters()
 
     def apply_filters(self):
         if not self.records: return
-        options=dict(shop=self.shop_var.get(),activity=self.act_var.get(),
-                     status=self.status_var.get(),metric=self.metric_var.get(),
-                     operator=self.comp_var.get(),threshold=self.threshold_var.get(),
-                     count_metric=self.qty_metric.get(),count_operator=self.qty_comp.get(),
-                     count_threshold=self.qty_threshold.get())
+        conditions=[]
+        for index,row in enumerate(self.filter_condition_rows,1):
+            field=row['field_var'].get().strip()
+            operator=row['operator_var'].get().strip()
+            value=row['value_var'].get().strip()
+            if not field and not operator and not value:
+                continue
+            if not field or not operator:
+                messagebox.showwarning('筛选条件',f'第 {index} 条条件请先选择列和比较方式。');return
+            if operator not in ('为空','不为空') and not value:
+                messagebox.showwarning('筛选条件',f'第 {index} 条条件请填写筛选值。');return
+            conditions.append({'field':field,'operator':operator,'value':value})
         if len(self.records) > 8000:
-            self._submit(lambda: filter_records(self.records, **options), 'filtered', '正在后台筛选…')
+            rows=self.records
+            self._submit(lambda: filter_records(rows,conditions=conditions), 'filtered', '正在后台筛选…')
             return
         try:
-            self.filtered=filter_records(self.records,**options)
+            self.filtered=filter_records(self.records,conditions=conditions)
         except ValueError as e:
             messagebox.showwarning('筛选条件',str(e));return
         self._render_records()

@@ -42,6 +42,24 @@ class TestCore(unittest.TestCase):
         self.assertEqual(len(filter_records(rows, shop='north')), 1)
         self.assertEqual(len(filter_records(rows, activity='2026-Q1')), 2)
 
+    def test_generic_dynamic_filter_conditions(self):
+        rows=[
+            {'Region':'North','Revenue':1200,'Period':'2026-Q1','_id':'1'},
+            {'Region':'South','Revenue':900,'Period':'2026-Q1','_id':'2'},
+            {'Region':'North','Revenue':None,'Period':'2026-Q2','_id':'3'},
+        ]
+        result=filter_records(rows,conditions=[
+            {'field':'Region','operator':'等于','value':'north'},
+            {'field':'Revenue','operator':'>=','value':'1000'},
+        ])
+        self.assertEqual([row['_id'] for row in result],['1'])
+        self.assertEqual([row['_id'] for row in filter_records(
+            rows,conditions=[{'field':'Revenue','operator':'为空','value':''}])],['3'])
+        self.assertEqual([row['_id'] for row in filter_records(
+            rows,conditions=[{'field':'Period','operator':'包含','value':'Q1'}])],['1','2'])
+        with self.assertRaisesRegex(ValueError,'必须是数字'):
+            filter_records(rows,conditions=[{'field':'Revenue','operator':'>','value':'high'}])
+
     def test_jobs_and_paging(self):
         jobs=make_jobs(self.records,['任务服务店名称','活动名称','任务执行率'],group_by_shop=True,page_size=1)
         self.assertEqual(len(jobs),5)

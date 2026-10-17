@@ -190,7 +190,16 @@ def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
 
 def filter_records(records: list[dict], shop: str = '', activity: str = '', status: str = '',
                    metric: str = '', operator: str = '<', threshold: str = '',
-                   count_metric: str = '', count_operator: str = '>', count_threshold: str = '') -> list[dict]:
+                   count_metric: str = '', count_operator: str = '>', count_threshold: str = '',
+                   conditions: list[dict] | None = None) -> list[dict]:
+    """Filter records using generic field conditions or the legacy arguments.
+
+    Generic conditions use ``field``, ``operator`` and ``value`` keys. Supported
+    operators are text comparisons (contains/equality) and numeric comparisons.
+    Legacy parameters remain for callers from older versions.
+    """
+    if conditions is not None:
+        return _filter_by_conditions(records, conditions)
     shop, activity = shop.strip().lower(), activity.strip().lower()
     if threshold.strip():
         target = number(threshold)
@@ -226,6 +235,47 @@ def filter_records(records: list[dict], shop: str = '', activity: str = '', stat
                 continue
         out.append(r)
     return out
+
+
+def _filter_by_conditions(records: list[dict], conditions: list[dict]) -> list[dict]:
+    compare = {'<': lambda a, b: a < b, '<=': lambda a, b: a <= b,
+               '=': lambda a, b: a == b, '>=': lambda a, b: a >= b,
+               '>': lambda a, b: a > b, '!=': lambda a, b: a != b}
+    text_ops = {'包含', '不包含', '等于', '不等于'}
+    output = []
+    for row in records:
+        matches = True
+        for condition in conditions:
+            field = str(condition.get('field') or '').strip()
+            op = str(condition.get('operator') or '').strip()
+            expected = condition.get('value', '')
+            if not field or not op:
+                continue
+            raw = row.get(field)
+            actual_text = text_of(raw, field).strip()
+            expected_text = str(expected if expected is not None else '').strip()
+            if op == '为空':
+                matches = not actual_text
+            elif op == '不为空':
+                matches = bool(actual_text)
+            elif op in text_ops:
+                a, b = actual_text.casefold(), expected_text.casefold()
+                matches = (b in a if op == '包含' else
+                           b not in a if op == '不包含' else
+                           a == b if op == '等于' else a != b)
+            elif op in compare:
+                actual = rate_number(raw) if is_rate_field(field) else number(raw)
+                target = rate_number(expected_text) if is_rate_field(field) else number(expected_text)
+                if target is None:
+                    raise ValueError(f'“{field}”的筛选值必须是数字')
+                matches = actual is not None and compare[op](actual, target)
+            else:
+                raise ValueError(f'不支持的筛选方式：{op}')
+            if not matches:
+                break
+        if matches:
+            output.append(row)
+    return output
 
 
 @dataclass
