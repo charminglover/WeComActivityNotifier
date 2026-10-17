@@ -12,15 +12,17 @@ import re
 import sys
 import os
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-import requests
-from PIL import Image, ImageDraw, ImageFont
+if TYPE_CHECKING:
+    from PIL import Image
 
 DEFAULT_FIELDS = [
     '任务服务店名称', '活动名称', '活动编码', '活动状态',
@@ -32,8 +34,12 @@ NAME_STORE = '任务服务店名称'
 ACTIVITY = '活动名称'
 PERCENT_NAMES = ('执行率', '达标率', '完成率')
 MAX_ROBOT_BYTES = 4096
-MAX_IMAGE_BYTES = 2 * 1024 * 1024 - 1024
-USER_AGENT = 'WeComActivityNotifier/1.0'
+MAX_IMAGE_BYTES = 1_950_000  # leave margin below the documented 2 MB (decimal)
+MAX_IMAGE_WIDTH = 3000
+MAX_IMAGE_HEIGHT = 6500
+MAX_IMAGE_PIXELS = 16_000_000
+MAX_MARKDOWN_SAFE = 3900
+USER_AGENT = 'WeComActivityNotifier/2.0'
 
 
 def text_of(value: Any, field: str = '') -> str:
@@ -247,7 +253,10 @@ def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = Fals
     return jobs
 
 
+@lru_cache(maxsize=16)
 def _get_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+
     if os.name == 'nt':
         folder = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts'
         names = ['msyhbd.ttc', 'simhei.ttf', 'msyh.ttc'] if bold else ['msyh.ttc', 'simhei.ttf', 'simsun.ttc']
@@ -265,21 +274,35 @@ def _get_font(size: int, bold: bool = False):
     return ImageFont.load_default(size=size)
 
 
-def _wrap(draw, text: str, font, width: int, max_lines: int = 3) -> list[str]:
-    text = str(text or '').replace('\n', ' ').replace('\r', '')
-    pieces = []
-    line = ''
-    for pos, char in enumerate(text):
-        if draw.textlength(line + char, font=font) > width and line:
-            if len(pieces) >= max_lines - 1:
-                return pieces + [_trim(draw, line + text[pos:], font, width)]
-            pieces.append(line)
-            line = char
-        else:
-            line += char
-    if line:
-        pieces.append(line)
-    return pieces[:max_lines] or ['']
+def _wrap(draw, text: str, font, width: int, max_lines: int | None = None) -> list[str]:
+    """Binary-search per-line wrapping avoids quadratic text measurement on long cells.
+    Never silently omit Excel text; oversized rows are rejected by the page planner.
+    """
+    value = str(text or '').replace('\n', ' ').replace('\r', ' ')
+    if not value:
+        return ['']
+    if max_lines is None and draw.textlength(value, font=font) > width * 170:
+        raise ValueError('单元格文本过长，无法在一张图片完整呈现；请取消超长备注等字段')
+    result = []
+    pos = 0
+    while pos < len(value):
+        low, high, best = pos + 1, len(value), pos + 1
+        while low <= high:
+            mid = (low + high) // 2
+            if draw.textlength(value[pos:mid], font=font) <= width:
+                best = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        result.append(value[pos:best])
+        pos = best
+        if len(result) > 170:
+            raise ValueError('单元格文本过长，无法在一张图片完整呈现；请取消超长备注等字段')
+        if max_lines is not None and len(result) >= max_lines and pos < len(value):
+            # Only used for non-data decoration, never for tabular data.
+            result[-1] = _trim(draw, result[-1] + value[pos:], font, width)
+            break
+    return result
 
 
 def _trim(draw, value: str, font, max_width: int) -> str:
@@ -307,57 +330,86 @@ def _col_width(field: str) -> int:
     return 155 if any(k in field for k in ('率', '台数', '数量')) else 185
 
 
+class ImagePageOverflow(ValueError):
+    """Page needs to be split before allocating a large bitmap."""
+
+
 def render_table(job: Job, warning_rate: float = 80) -> Image.Image:
+    from PIL import Image, ImageDraw
+
     columns = job.fields
     widths = [66] + [_col_width(c) for c in columns]
     full_width = sum(widths) + 72
+    if full_width > MAX_IMAGE_WIDTH:
+        raise ImagePageOverflow('图片列宽过大')
     face = _get_font(20)
     headfont = _get_font(20, True)
     titlefont = _get_font(30, True)
     small = _get_font(18)
-    canvas = Image.new('RGB', (full_width, 4000), 'white')
+    # Create only a tiny measurement surface; allocate the report at its actual size.
+    d = ImageDraw.Draw(Image.new('RGB', (1, 1)))
+    wrapped = []
+    total_height = 122 + 52 + 58
+    for row in job.rows:
+        lines = [['']]
+        for f in columns:
+            lines.append(_wrap(d, text_of(row.get(f), f), face, _col_width(f) - 20))
+        h = max(48, max(len(v) for v in lines) * 28 + 18)
+        total_height += h
+        wrapped.append((lines, h))
+    if total_height > MAX_IMAGE_HEIGHT or full_width * total_height > MAX_IMAGE_PIXELS:
+        raise ImagePageOverflow('图片尺寸过大，需要自动分页')
+    canvas = Image.new('RGB', (full_width, total_height), 'white')
     d = ImageDraw.Draw(canvas)
     d.text((36, 28), job.title, fill='#202020', font=titlefont)
     subtitle = f'{job.store_name}  ' if job.store_name else ''
     subtitle += f'共 {len(job.rows)} 条活动  ·  第 {job.part}/{job.parts} 页'
-    d.text((36, 82), _trim(d, subtitle, small, full_width-72), fill='#666666', font=small)
+    d.text((36, 82), _trim(d, subtitle, small, full_width - 72), fill='#666666', font=small)
     y = 122
     x = 36
     for width, field in zip(widths, ['序号'] + columns):
-        d.rectangle((x,y,x+width,y+52), fill='#E8ECF1', outline='#CCD3DD', width=1)
-        d.text((x+10,y+14), _trim(d,field,headfont,width-20), fill='#222222',font=headfont)
+        d.rectangle((x, y, x + width, y + 52), fill='#E8ECF1', outline='#CCD3DD', width=1)
+        d.text((x + 10, y + 14), _trim(d, field, headfont, width - 20), fill='#222222', font=headfont)
         x += width
     y += 52
-    for idx, r in enumerate(job.rows, 1):
-        line_list = [['%s' % idx]]
-        for field in columns:
-            line_list.append(_wrap(d, text_of(r.get(field), field), face, _col_width(field)-20, 3))
-        row_height = max(48, max(len(v) for v in line_list)*28+18)
+    for idx, (row, (lines_by_col, row_height)) in enumerate(zip(job.rows, wrapped), 1):
+        lines_by_col[0] = [str(idx)]
         x = 36
-        for ci, (width, lines) in enumerate(zip(widths, line_list)):
+        for ci, (width, lines) in enumerate(zip(widths, lines_by_col)):
             shade = '#FFFFFF' if idx % 2 else '#F8F9FB'
-            if ci > 0 and is_rate_field(columns[ci-1]):
-                rate = rate_number(r.get(columns[ci-1]))
+            if ci > 0 and is_rate_field(columns[ci - 1]):
+                rate = rate_number(row.get(columns[ci - 1]))
                 if rate is not None and rate < warning_rate:
                     shade = '#FCECEA'
-            d.rectangle((x,y,x+width,y+row_height), fill=shade, outline='#D9DEE6', width=1)
+            d.rectangle((x, y, x + width, y + row_height), fill=shade, outline='#D9DEE6', width=1)
             for n, line in enumerate(lines):
-                d.text((x+10,y+12+n*28),line,fill='#202020',font=face)
+                d.text((x + 10, y + 12 + n * 28), line, fill='#202020', font=face)
             x += width
         y += row_height
-    foot = '说明：低于设定阈值的完成率以浅红色标识；每行对应 Excel 的一条活动记录。'
-    d.text((36,y+20),_trim(d,foot,small,full_width-72),fill='#707070',font=small)
-    return canvas.crop((0,0,full_width,y+58))
+    d.text((36, y + 20), '低于警示阈值的完成率以浅红色标识', fill='#707070', font=small)
+    return canvas
 
 
 def image_bytes(image: Image.Image) -> bytes:
-    for quality in (89, 80, 69, 55):
-        buf = io.BytesIO()
-        image.convert('RGB').save(buf, format='JPEG', quality=quality, optimize=True, progressive=True)
-        value = buf.getvalue()
-        if len(value) < MAX_IMAGE_BYTES:
-            return value
-    raise ValueError('图片超过企业微信 2MB 限制，请减小每张图片的行数或列数')
+    """Produce a valid JPG payload under the group robot's documented 2 MB cap.
+    Exact encoding is checked before transport. No truncated images are used.
+    """
+    from PIL import Image
+
+    if image.width <= 0 or image.height <= 0:
+        raise ValueError('图片尺寸无效')
+    for scale in (1.0, 0.90, 0.78, 0.66):
+        scaled = image if scale == 1 else image.resize((max(1, int(image.width * scale)),
+                                                         max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+        for quality in (88, 78, 66, 52):
+            buf = io.BytesIO()
+            scaled.convert('RGB').save(buf, format='JPEG', quality=quality, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= MAX_IMAGE_BYTES:
+                with Image.open(io.BytesIO(data)) as im:
+                    im.verify()
+                return data
+    raise ImagePageOverflow('单页图片即使压缩仍超出 2 MB，需要自动分页')
 
 
 def markdown_table(job: Job) -> str:
@@ -375,35 +427,86 @@ def markdown_table(job: Job) -> str:
 
 
 
-def fit_markdown_jobs(jobs: list[Job]) -> list[Job]:
-    """Automatically split overlong markdown_v2 messages by rows/columns."""
-    def fit(job):
-        try:
-            markdown_table(job)
-            return [job]
-        except ValueError:
-            if len(job.rows) > 1:
-                mid = len(job.rows) // 2
-                left = Job(job.title,job.fields,job.rows[:mid],job.store_code,job.store_name)
-                right = Job(job.title,job.fields,job.rows[mid:],job.store_code,job.store_name)
-                return fit(left) + fit(right)
-            if len(job.fields) > 1:
-                mid = len(job.fields) // 2
-                left = Job(job.title,job.fields[:mid],job.rows,job.store_code,job.store_name)
-                right = Job(job.title,job.fields[mid:],job.rows,job.store_code,job.store_name)
-                return fit(left) + fit(right)
-            raise ValueError('单条活动单个字段已超过企业微信 4096 字节限制，无法继续自动分页')
-    expanded = []
+@dataclass
+class PreparedMessage:
+    job: Job
+    mode: str
+    payload: bytes | str
+
+
+def _split_to_fit(job: Job, mode: str, warning_rate: float):
+    """Pack by actual serialized bytes rather than estimated rows/columns."""
+    try:
+        if mode == '图片表格':
+            payload = image_bytes(render_table(job, warning_rate))
+        elif mode == 'Markdown表格':
+            payload = markdown_table(job)
+            if len(payload.encode('utf-8')) > MAX_MARKDOWN_SAFE:
+                raise ValueError('Markdown 安全分页阈值')
+        else:
+            raise ValueError('未知消息格式')
+        return [PreparedMessage(job, mode, payload)]
+    except (ValueError, ImagePageOverflow):
+        if len(job.rows) > 1:
+            middle = len(job.rows) // 2
+            left = Job(job.title, job.fields, job.rows[:middle], job.store_code, job.store_name)
+            right = Job(job.title, job.fields, job.rows[middle:], job.store_code, job.store_name)
+            return _split_to_fit(left, mode, warning_rate) + _split_to_fit(right, mode, warning_rate)
+        if len(job.fields) > 1:
+            middle = len(job.fields) // 2
+            left = Job(job.title, job.fields[:middle], job.rows, job.store_code, job.store_name)
+            right = Job(job.title, job.fields[middle:], job.rows, job.store_code, job.store_name)
+            return _split_to_fit(left, mode, warning_rate) + _split_to_fit(right, mode, warning_rate)
+        field = job.fields[0]
+        raise ValueError(f'一条活动中的「{field}」内容单独成页仍超过推送限制，已取消本批发送；请检查该单元格内容') from None
+
+
+def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: float = 80,
+                     max_messages: int = 500) -> list[PreparedMessage]:
+    """Safely render/validate the entire batch BEFORE confirming any network send."""
+    prepared: list[PreparedMessage] = []
     for job in jobs:
-        expanded.extend(fit(job))
-    segments = defaultdict(list)
-    for job in expanded:
-        segments[(job.store_code,job.store_name)].append(job)
-    for group in segments.values():
-        for idx,job in enumerate(group,1):
-            job.part = idx
-            job.parts = len(group)
-    return expanded
+        prepared.extend(_split_to_fit(job, mode, warning_rate))
+        if len(prepared) > max_messages:
+            raise ValueError(f'本批超过 {max_messages} 条消息，已取消预处理；请缩小筛选范围')
+    # Page counters change after a split; validate again using the final counters.
+    # Iterate until splitting is stable (the counter itself can affect size).
+    for _ in range(20):
+        original_counters = {id(m.job): (m.job.part, m.job.parts) for m in prepared}
+        groups = defaultdict(list)
+        for msg in prepared:
+            groups[(msg.job.store_code, msg.job.store_name)].append(msg)
+        for group in groups.values():
+            for idx, msg in enumerate(group, 1):
+                msg.job.part, msg.job.parts = idx, len(group)
+        final: list[PreparedMessage] = []
+        split_again = False
+        for msg in prepared:
+            try:
+                # Avoid duplicate image encoding when make_jobs' counters were already correct.
+                if original_counters[id(msg.job)] != (msg.job.part, msg.job.parts):
+                    if mode == '图片表格':
+                        msg.payload = image_bytes(render_table(msg.job, warning_rate))
+                    else:
+                        msg.payload = markdown_table(msg.job)
+                final.append(msg)
+            except (ImagePageOverflow, ValueError):
+                replacement = _split_to_fit(msg.job, mode, warning_rate)
+                if len(replacement) == 1:
+                    raise ValueError('页码变化造成单页超限；该活动字段无法进一步拆分') from None
+                final.extend(replacement)
+                split_again = True
+        if len(final) > max_messages:
+            raise ValueError(f'本批超过 {max_messages} 条消息，已取消发送')
+        if not split_again:
+            return final
+        prepared = final
+    raise ValueError('分页校验未能收敛，已取消发送，请减少超长字段')
+
+
+def fit_markdown_jobs(jobs: list[Job]) -> list[Job]:
+    """Backward compatible wrapper. New UI uses prepare_messages directly."""
+    return [m.job for m in prepare_messages(jobs, 'Markdown表格')]
 
 
 def readable_jobs(jobs: list[Job], mode: str = '图片表格') -> tuple[int, list[str]]:
@@ -465,9 +568,21 @@ def _safe_error(e: Exception, secrets: list[str]) -> str:
     return result
 
 
+def image_upload_form(data: bytes) -> tuple[dict[str, str], bytes]:
+    """WeCom multipart upload with filename, MIME type, and filelength metadata."""
+    boundary = 'wecom_' + uuid.uuid4().hex
+    head = (f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="media"; filename="activity_report.jpg"; filelength={len(data)}\r\n'
+            f'Content-Type: image/jpeg\r\n\r\n').encode('ascii')
+    body = head + data + f'\r\n--{boundary}--\r\n'.encode('ascii')
+    return {'Content-Type': f'multipart/form-data; boundary={boundary}'}, body
+
+
 class WeComSender:
     def __init__(self, kind: str, *, webhook: str = '', corpid: str = '', secret: str = '',
                  agentid: str = '', touser: str = '', timeout: int = 15):
+        import requests
+
         self.kind = kind
         self.webhook = webhook.strip()
         self.corpid = corpid.strip()
@@ -476,6 +591,7 @@ class WeComSender:
         self.touser = touser.strip()
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.headers.update({'User-Agent': USER_AGENT})
         self._token = None
         if kind == '群机器人Webhook':
             if self.webhook:
@@ -485,6 +601,8 @@ class WeComSender:
                 raise ValueError('应用模式需要填写 CorpID、Secret、数字 AgentID')
 
     def _request(self, method, url, **kwargs):
+        import requests
+
         try:
             return _ensure_ok(self.session.request(method, url, timeout=self.timeout, **kwargs))
         except requests.RequestException as e:
@@ -499,15 +617,18 @@ class WeComSender:
                 raise RuntimeError('无法获取企业微信 access_token')
         return self._token
 
-    def send(self, job: Job, mode: str, recipient: str = '', warning_rate: float = 80):
+    def send(self, job: Job | PreparedMessage, mode: str, recipient: str = '', warning_rate: float = 80):
+        prepared = job if isinstance(job, PreparedMessage) else None
+        if prepared:
+            job, mode = prepared.job, prepared.mode
         if self.kind == '群机器人Webhook':
             url = check_webhook(recipient or self.webhook)
             if mode == '图片表格':
-                b = image_bytes(render_table(job, warning_rate))
+                b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate))
                 body = {'msgtype':'image', 'image':{'base64':base64.b64encode(b).decode('ascii'),
                                                   'md5':hashlib.md5(b).hexdigest()}}
             elif mode == 'Markdown表格':
-                body = {'msgtype':'markdown_v2', 'markdown_v2':{'content':markdown_table(job)}}
+                body = {'msgtype':'markdown_v2', 'markdown_v2':{'content':prepared.payload if prepared else markdown_table(job)}}
             else:
                 raise ValueError('无效消息格式')
             return self._request('POST', url, json=body)
@@ -515,10 +636,11 @@ class WeComSender:
         if not user:
             raise ValueError('请配置 UserID 或导入服务店映射表')
         if mode == '图片表格':
-            b = image_bytes(render_table(job, warning_rate))
+            b = prepared.payload if prepared else image_bytes(render_table(job, warning_rate))
+            upload_headers, upload_data = image_upload_form(b)
             upload = self._request('POST', 'https://qyapi.weixin.qq.com/cgi-bin/media/upload',
                                    params={'access_token':self.token(), 'type':'image'},
-                                   files={'media': ('activity_report.jpg', io.BytesIO(b), 'image/jpeg')})
+                                   data=upload_data, headers=upload_headers)
             body = {'touser':user, 'msgtype':'image', 'agentid':int(self.agentid),
                     'image':{'media_id':upload['media_id']}}
         else:

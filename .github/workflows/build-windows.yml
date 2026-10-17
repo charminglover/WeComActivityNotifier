@@ -1,74 +1,62 @@
 name: Build Windows EXE
-
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
-    paths:
-      - "main.py"
-      - "engine.py"
-      - "requirements.txt"
-      - "build_smoke_test.py"
-      - "演示活动数据.xlsx"
-      - ".github/workflows/build-windows.yml"
-
+    branches: [main]
 permissions:
   contents: read
-
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: Verify Excel and image-table features
-        run: python build_smoke_test.py
-
-      - name: Build directory-based Windows application
-        run: >-
-          python -m PyInstaller --noconfirm --clean --onedir --windowed
-          --name WeComActivityNotifier
-          --hidden-import xlrd
-          --collect-all openpyxl
-          --collect-all PIL
-          --collect-all certifi
-          main.py
-
-      - name: Verify the packaged application starts
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build portable folder distribution
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --collect-all openpyxl --collect-all PIL --collect-all certifi --hidden-import xlrd main.py
+      - name: Verify packaged GUI startup
         shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist/WeComActivityNotifier/WeComActivityNotifier.exe"
-          if (-not (Test-Path $exe)) { throw "EXE was not created: $exe" }
+          $exe = 'dist/WeComActivityNotifier/WeComActivityNotifier.exe'
+          if (!(Test-Path $exe)) { throw 'Executable was not produced' }
+          $started = Get-Date
           $process = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 8
-          $process.Refresh()
-          if ($process.HasExited) {
-            throw "The packaged application exited during startup (exit code $($process.ExitCode))."
+          $deadline = $started.AddSeconds(20)
+          do {
+            Start-Sleep -Milliseconds 200
+            $process.Refresh()
+            if ($process.HasExited) { throw "The application exited during startup (code $($process.ExitCode))." }
+            if ($process.MainWindowHandle -ne 0) { break }
+          } while ((Get-Date) -lt $deadline)
+          if ($process.MainWindowHandle -eq 0) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw 'The application window did not appear within 20 seconds.'
           }
+          $elapsed = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
+          Write-Host "Main window appeared in $elapsed seconds."
           Stop-Process -Id $process.Id -Force
-
-      - name: Package application directory
+      - name: Check executable and create SHA256
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/WeComActivityNotifier" -DestinationPath "dist/WeComActivityNotifier-Windows-x64.zip" -CompressionLevel Optimal -Force
-
-      - name: Upload downloadable Windows application
+          $exe = 'dist/WeComActivityNotifier/WeComActivityNotifier.exe'
+          if (!(Test-Path $exe)) { throw 'Executable was not produced' }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  WeComActivityNotifier.exe" | Set-Content -Path dist/WeComActivityNotifier/SHA256.txt -Encoding utf8
+          Write-Host "Built EXE sha256=$hash"
+      - name: Package portable folder as ZIP
+        shell: pwsh
+        run: Compress-Archive -Path 'dist/WeComActivityNotifier' -DestinationPath 'dist/WeComActivityNotifier-Windows-Portable.zip' -CompressionLevel Optimal -Force
+      - name: Upload portable Windows app
         uses: actions/upload-artifact@v4
         with:
-          name: WeComActivityNotifier-Windows-x64
-          path: dist/WeComActivityNotifier-Windows-x64.zip
+          name: WeComActivityNotifier-Windows-Portable
+          path: dist/WeComActivityNotifier-Windows-Portable.zip
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14

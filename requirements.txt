@@ -1,5 +1,5 @@
-Pillow>=10.1,<13
-requests>=2.31,<3
 openpyxl>=3.1,<4
-xlrd>=2,<3
-PyInstaller>=6.10,<7
+xlrd>=2.0,<3
+Pillow>=11,<13
+requests>=2.31,<3
+pyinstaller>=6.11,<8

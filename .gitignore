@@ -2,4 +2,8 @@ __pycache__/
 *.py[cod]
 /build/
 /dist/
+/dist_onefile/
 /*.spec
+服务店映射_应用消息.csv
+服务店映射_群机器人.csv
+推送图片预览_v2.jpg
