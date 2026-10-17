@@ -242,35 +242,41 @@ def _filter_by_conditions(records: list[dict], conditions: list[dict]) -> list[d
                '=': lambda a, b: a == b, '>=': lambda a, b: a >= b,
                '>': lambda a, b: a > b, '!=': lambda a, b: a != b}
     text_ops = {'包含', '不包含', '等于', '不等于'}
+    compiled = []
+    for condition in conditions:
+        field = str(condition.get('field') or '').strip()
+        op = str(condition.get('operator') or '').strip()
+        expected = condition.get('value', '')
+        if not field or not op:
+            continue
+        expected_text = str(expected if expected is not None else '').strip()
+        if op in compare:
+            target = rate_number(expected_text) if is_rate_field(field) else number(expected_text)
+            if target is None:
+                raise ValueError(f'“{field}”的筛选值必须是数字')
+            compiled.append((field, op, expected_text, expected_text.casefold(), target))
+        elif op in text_ops or op in ('为空', '不为空'):
+            compiled.append((field, op, expected_text, expected_text.casefold(), None))
+        else:
+            raise ValueError(f'不支持的筛选方式：{op}')
     output = []
     for row in records:
         matches = True
-        for condition in conditions:
-            field = str(condition.get('field') or '').strip()
-            op = str(condition.get('operator') or '').strip()
-            expected = condition.get('value', '')
-            if not field or not op:
-                continue
+        for field, op, expected_text, expected_folded, target in compiled:
             raw = row.get(field)
             actual_text = text_of(raw, field).strip()
-            expected_text = str(expected if expected is not None else '').strip()
             if op == '为空':
                 matches = not actual_text
             elif op == '不为空':
                 matches = bool(actual_text)
             elif op in text_ops:
-                a, b = actual_text.casefold(), expected_text.casefold()
+                a, b = actual_text.casefold(), expected_folded
                 matches = (b in a if op == '包含' else
                            b not in a if op == '不包含' else
                            a == b if op == '等于' else a != b)
             elif op in compare:
                 actual = rate_number(raw) if is_rate_field(field) else number(raw)
-                target = rate_number(expected_text) if is_rate_field(field) else number(expected_text)
-                if target is None:
-                    raise ValueError(f'“{field}”的筛选值必须是数字')
                 matches = actual is not None and compare[op](actual, target)
-            else:
-                raise ValueError(f'不支持的筛选方式：{op}')
             if not matches:
                 break
         if matches:
