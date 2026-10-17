@@ -12,7 +12,7 @@ if errorlevel 1 goto fail
 py -m unittest discover -s tests -v
 if errorlevel 1 goto fail
 rem Always build the portable folder; dependencies stay outside the EXE.
-py -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --collect-all openpyxl --collect-all PIL --collect-all certifi --hidden-import xlrd main.py
+py -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --collect-all openpyxl --collect-all PIL --collect-all certifi --collect-all keyring --hidden-import xlrd main.py
 if errorlevel 1 goto fail
 py -c "import hashlib,pathlib; p=pathlib.Path('dist/WeComActivityNotifier/WeComActivityNotifier.exe'); h=hashlib.file_digest(p.open('rb'),'sha256').hexdigest(); pathlib.Path('dist/WeComActivityNotifier/SHA256.txt').write_text(h+'  WeComActivityNotifier.exe\n'); print('SHA256:',h)"
 if errorlevel 1 goto fail

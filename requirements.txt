@@ -4,3 +4,4 @@ Pillow>=11,<13
 requests>=2.31,<3
 PySide6>=6.8,<7
 pyinstaller>=6.11,<8
+keyring>=25,<26

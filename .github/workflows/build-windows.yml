@@ -20,7 +20,7 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Build portable folder distribution
-        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --collect-all openpyxl --collect-all PIL --collect-all certifi --hidden-import xlrd main.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --collect-all openpyxl --collect-all PIL --collect-all certifi --collect-all keyring --hidden-import xlrd main.py
       - name: Verify packaged GUI startup
         shell: pwsh
         run: |

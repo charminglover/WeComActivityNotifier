@@ -89,7 +89,7 @@ def rate_number(value: Any) -> float | None:
     return n
 
 
-def read_excel(path: str) -> tuple[list[str], list[dict]]:
+def read_excel(path: str, cancel_event=None) -> tuple[list[str], list[dict]]:
     """Read ALL worksheets, use header row within first 15 rows, preserve source row IDs.
     This function is designed for running off the UI thread.
     """
@@ -103,7 +103,7 @@ def read_excel(path: str) -> tuple[list[str], list[dict]]:
                 if ws.sheet_state != 'visible':
                     continue
                 sheets.append((ws.title, ws.iter_rows(values_only=True)))
-            return _parse_sheets(sheets)
+            return _parse_sheets(sheets, cancel_event)
         finally:
             wb.close()
     if suffix == '.xls':
@@ -115,22 +115,21 @@ def read_excel(path: str) -> tuple[list[str], list[dict]]:
                     for i in range(sheet.nrows):
                         yield sheet.row_values(i)
                 sheets.append((ws.name, rows_for()))
-            return _parse_sheets(sheets)
+            return _parse_sheets(sheets, cancel_event)
         finally:
             wb.release_resources()
     if suffix == '.csv':
         for encoding in ('utf-8-sig', 'gb18030'):
             try:
                 with open(path, 'r', encoding=encoding, newline='') as f:
-                    rows = list(csv.reader(f))
-                return _parse_sheets([('CSV', rows)])
+                    return _parse_sheets([('CSV', csv.reader(f))], cancel_event)
             except UnicodeDecodeError:
                 continue
         raise ValueError('CSV 编码无法识别（支持 UTF-8 / GB18030）')
     raise ValueError('支持 .xlsx、.xlsm、.xls 和 .csv')
 
 
-def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
+def _parse_sheets(sheets, cancel_event=None) -> tuple[list[str], list[dict]]:
     all_fields: list[str] = []
     all_records: list[dict] = []
     for sheet_name, iterator in sheets:
@@ -176,6 +175,8 @@ def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
             yield from ahead[head_idx + 1:]
             yield from it
         for row_number, values in enumerate(make_rows(), head_idx + 2):
+            if cancel_event is not None and row_number % 512 == 0 and cancel_event.is_set():
+                raise InterruptedError("导入已取消")
             if not any(v is not None and str(v).strip() for v in values):
                 continue
             row = {field: values[i] if i < len(values) else None for i, field in enumerate(header)}
@@ -191,7 +192,7 @@ def _parse_sheets(sheets) -> tuple[list[str], list[dict]]:
 def filter_records(records: list[dict], shop: str = '', activity: str = '', status: str = '',
                    metric: str = '', operator: str = '<', threshold: str = '',
                    count_metric: str = '', count_operator: str = '>', count_threshold: str = '',
-                   conditions: list[dict] | None = None) -> list[dict]:
+                   conditions: list[dict] | None = None, cancel_event=None) -> list[dict]:
     """Filter records using generic field conditions or the legacy arguments.
 
     Generic conditions use ``field``, ``operator`` and ``value`` keys. Supported
@@ -199,7 +200,7 @@ def filter_records(records: list[dict], shop: str = '', activity: str = '', stat
     Legacy parameters remain for callers from older versions.
     """
     if conditions is not None:
-        return _filter_by_conditions(records, conditions)
+        return _filter_by_conditions(records, conditions, cancel_event)
     shop, activity = shop.strip().lower(), activity.strip().lower()
     if threshold.strip():
         target = number(threshold)
@@ -216,7 +217,9 @@ def filter_records(records: list[dict], shop: str = '', activity: str = '', stat
     compare = {'<': lambda a,b: a<b, '<=': lambda a,b: a<=b, '=':lambda a,b: a==b,
                '>=':lambda a,b: a>=b, '>':lambda a,b: a>b}
     out = []
-    for r in records:
+    for row_index, r in enumerate(records):
+        if cancel_event is not None and row_index % 2048 == 0 and cancel_event.is_set():
+            raise InterruptedError("筛选已取消")
         values = ' '.join(str(value) for key, value in r.items()
                           if not key.startswith('_') and value is not None).lower()
         if shop and shop not in values:
@@ -237,7 +240,7 @@ def filter_records(records: list[dict], shop: str = '', activity: str = '', stat
     return out
 
 
-def _filter_by_conditions(records: list[dict], conditions: list[dict]) -> list[dict]:
+def _filter_by_conditions(records: list[dict], conditions: list[dict], cancel_event=None) -> list[dict]:
     compare = {'<': lambda a, b: a < b, '<=': lambda a, b: a <= b,
                '=': lambda a, b: a == b, '>=': lambda a, b: a >= b,
                '>': lambda a, b: a > b, '!=': lambda a, b: a != b}
@@ -260,7 +263,9 @@ def _filter_by_conditions(records: list[dict], conditions: list[dict]) -> list[d
         else:
             raise ValueError(f'不支持的筛选方式：{op}')
     output = []
-    for row in records:
+    for row_index, row in enumerate(records):
+        if cancel_event is not None and row_index % 2048 == 0 and cancel_event.is_set():
+            raise InterruptedError("筛选已取消")
         matches = True
         for field, op, expected_text, expected_folded, target in compiled:
             raw = row.get(field)

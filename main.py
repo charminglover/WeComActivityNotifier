@@ -1,199 +1,36 @@
 """PySide6 desktop application for importing, filtering, and sending Excel records."""
 from __future__ import annotations
 
-import json
-import os
 import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QRunnable,
-                            Qt, QThreadPool, Signal)
+from PySide6.QtCore import QThread, QThreadPool, Qt, QTimer
 from PySide6.QtGui import QAction, QFont, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
     QFileDialog, QFormLayout, QGroupBox, QHeaderView, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QTableView,
+    QProgressBar, QPushButton, QScrollArea, QTabWidget, QTableView,
     QTextEdit, QVBoxLayout, QWidget)
 
-from engine import (check_webhook, filter_records, make_jobs, number,
-                    prepare_messages, read_excel, read_mapping, text_of,
-                    WeComSender)
+from engine import filter_records, number, read_excel, text_of, WeComSender
+from services.notification_workflow import prepare_selection, validate_routes
+from ui.table_model import CheckboxDelegate, RecordTableModel
+from ui.filter_condition import FilterCondition
+from services.task_worker import Worker
+from services.config_store import ConfigStore
+from services.mapping_store import MappingStore
+from ui.mapping_dialog import MappingDialog
 
 APP_NAME = '企业微信活动通知工具'
-CONFIG_PATH = (Path(os.environ.get('APPDATA', str(Path.home()))) /
-               'WeComActivityNotifier' / 'preferences.json')
 
 
-class RecordTableModel(QAbstractTableModel):
-    """Virtual table model: Qt paints only visible cells instead of creating row widgets."""
-    checkedChanged = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.fields: list[str] = []
-        self.rows: list[dict] = []
-        self.checked: set[str] = set()
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.rows)
-
-    def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.fields) + 1
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or not (0 <= index.row() < len(self.rows)):
-            return None
-        row = self.rows[index.row()]
-        if index.column() == 0:
-            if role == Qt.ItemDataRole.CheckStateRole:
-                return (Qt.CheckState.Checked if row.get('_id') in self.checked
-                        else Qt.CheckState.Unchecked)
-            if role == Qt.ItemDataRole.TextAlignmentRole:
-                return int(Qt.AlignmentFlag.AlignCenter)
-            return None
-        field = self.fields[index.column() - 1]
-        if role == Qt.ItemDataRole.DisplayRole:
-            return text_of(row.get(field), field)
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return text_of(row.get(field), field)
-        if role == Qt.ItemDataRole.BackgroundRole and row.get('_id') in self.checked:
-            from PySide6.QtGui import QColor
-            return QColor('#EAF2FC')
-        return None
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        if orientation == Qt.Orientation.Horizontal:
-            return '勾选' if section == 0 else self.fields[section - 1]
-        return str(section + 1)
-
-    def flags(self, index):
-        if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        return base | Qt.ItemFlag.ItemIsUserCheckable if index.column() == 0 else base
-
-    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if (not index.isValid() or index.column() != 0 or
-                role != Qt.ItemDataRole.CheckStateRole):
-            return False
-        key = self.rows[index.row()].get('_id')
-        if value == Qt.CheckState.Checked:
-            self.checked.add(key)
-        else:
-            self.checked.discard(key)
-        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole,
-                                              Qt.ItemDataRole.BackgroundRole])
-        self.checkedChanged.emit()
-        return True
-
-    def set_content(self, fields, rows, checked=None):
-        self.beginResetModel()
-        self.fields = list(fields)
-        self.rows = rows
-        if checked is not None:
-            self.checked = checked
-        self.endResetModel()
-        self.checkedChanged.emit()
-
-    def refresh_checks(self):
-        if self.rows:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(self.rows) - 1, 0),
-                                  [Qt.ItemDataRole.CheckStateRole,
-                                   Qt.ItemDataRole.BackgroundRole])
-        self.checkedChanged.emit()
 
 
-class WorkerSignals(QObject):
-    succeeded = Signal(int, object)
-    failed = Signal(int, str)
-    progress = Signal(str)
 
 
-class Worker(QRunnable):
-    def __init__(self, task_id, function):
-        super().__init__()
-        self.task_id = task_id
-        self.function = function
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            result = self.function(self.signals.progress.emit)
-            self.signals.succeeded.emit(self.task_id, result)
-        except Exception as exc:
-            self.signals.failed.emit(self.task_id, str(exc))
 
 
-class FilterCondition(QWidget):
-    removed = Signal(object)
-    changed = Signal()
-
-    def __init__(self, fields, numeric_fields, parent=None):
-        super().__init__(parent)
-        self.numeric_fields = numeric_fields
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 2, 0, 2)
-        self.field = QComboBox()
-        self.field.addItem('选择列…', None)
-        self.field.addItems(fields)
-        self.field.setCurrentIndex(0)
-        self.field.setMinimumWidth(180)
-        self.operator = QComboBox()
-        self.operator.addItem('比较方式…', None)
-        self.operator.setEnabled(False)
-        self.operator.setMinimumWidth(118)
-        self.value = QLineEdit()
-        self.value.setPlaceholderText('筛选值')
-        self.value.setEnabled(False)
-        self.value.setMinimumWidth(180)
-        self.remove_button = QPushButton('删除')
-        layout.addWidget(self.field)
-        layout.addWidget(self.operator)
-        layout.addWidget(self.value, 1)
-        layout.addWidget(self.remove_button)
-        self.field.currentIndexChanged.connect(self._field_changed)
-        self.operator.currentIndexChanged.connect(self._operator_changed)
-        self.value.textChanged.connect(self.changed)
-        self.remove_button.clicked.connect(lambda: self.removed.emit(self))
-
-    def _field_changed(self):
-        self.operator.blockSignals(True)
-        self.operator.clear()
-        self.operator.addItem('比较方式…', None)
-        field = self.field.currentText()
-        if self.field.currentIndex() > 0:
-            options = (['<', '<=', '=', '!=', '>=', '>', '为空', '不为空']
-                       if field in self.numeric_fields else
-                       ['包含', '不包含', '等于', '不等于', '为空', '不为空'])
-            self.operator.addItems(options)
-        self.operator.setCurrentIndex(0)
-        self.operator.blockSignals(False)
-        self.operator.setEnabled(self.field.currentIndex() > 0)
-        self.value.clear()
-        self.value.setEnabled(False)
-        self.changed.emit()
-
-    def _operator_changed(self):
-        op = self.operator.currentText()
-        self.value.setEnabled(bool(op and op != '比较方式…' and op not in ('为空', '不为空')))
-        if op in ('为空', '不为空'):
-            self.value.clear()
-        self.changed.emit()
-
-    def condition(self):
-        field = self.field.currentText() if self.field.currentIndex() > 0 else ''
-        operator = self.operator.currentText() if self.operator.currentIndex() > 0 else ''
-        value = self.value.text().strip()
-        if not field and not operator and not value:
-            return None
-        if not field or not operator:
-            raise ValueError('请先为每条筛选条件选择列和比较方式。')
-        if operator not in ('为空', '不为空') and not value:
-            raise ValueError(f'“{field}”条件还没有填写筛选值。')
-        return {'field': field, 'operator': operator, 'value': value}
 
 
 class App(QMainWindow):
@@ -211,22 +48,24 @@ class App(QMainWindow):
         self.filter_rows: list[FilterCondition] = []
         self.filter_generation = 0
         self.selection_generation = 0
+        self._fit_after_filter = False
         self.stop_event = threading.Event()
         self.sending = False
         self._next_task_id = 1
         self._workers = {}
+        self._closing = False
         self._callbacks = {}
-        self.pool = QThreadPool.globalInstance()
-        self.pool.setMaxThreadCount(max(2, min(4, self.pool.maxThreadCount())))
-        self.prefs = self._load_prefs()
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(max(2, min(3, QThread.idealThreadCount() or 2)))
+        self.pool.setExpiryTimeout(1000)
+        self.config_store = ConfigStore()
+        self.mapping_stores = {
+            '群机器人Webhook': MappingStore(kind='群机器人Webhook'),
+            '自建应用消息': MappingStore(kind='自建应用消息'),
+        }
+        self.prefs = self.config_store.load()
         self._build_ui()
         self._update_count()
-
-    def _load_prefs(self):
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            return {}
 
     def _build_ui(self):
         root = QWidget()
@@ -324,6 +163,7 @@ class App(QMainWindow):
         header.sectionDoubleClicked.connect(self._fit_one_column)
         self.table_model = RecordTableModel(self.table)
         self.table.setModel(self.table_model)
+        self.table.setItemDelegateForColumn(0, CheckboxDelegate(self.table))
         self.table_model.checkedChanged.connect(self._on_checked_changed)
         layout.addWidget(self.table, 1)
 
@@ -391,19 +231,12 @@ class App(QMainWindow):
         self._toggle_sender(self.kind_combo.currentText())
 
         mapping = QGroupBox('服务店接收目标映射（可选）')
-        map_layout = QVBoxLayout(mapping)
-        map_layout.addWidget(QLabel('CSV 列：任务服务店编码,Webhook（群机器人）或 任务服务店编码,UserID（应用）。导入后强制按服务店分组。'))
-        map_row = QHBoxLayout()
-        self.mapping_path = QLineEdit()
-        self.mapping_path.setReadOnly(True)
-        map_row.addWidget(self.mapping_path, 1)
-        map_button = QPushButton('导入 CSV…')
-        map_button.clicked.connect(self.choose_map)
-        map_row.addWidget(map_button)
-        remove_map = QPushButton('移除映射')
-        remove_map.clicked.connect(self.mapping_path.clear)
-        map_row.addWidget(remove_map)
-        map_layout.addLayout(map_row)
+        map_layout = QHBoxLayout(mapping)
+        map_layout.addWidget(QLabel('在软件内添加、编辑和保存接收目标；凭据使用系统凭据库。'))
+        map_layout.addStretch(1)
+        map_button = QPushButton('管理映射…')
+        map_button.clicked.connect(self.manage_mappings)
+        map_layout.addWidget(map_button)
         layout.addWidget(mapping)
 
         actions = QHBoxLayout()
@@ -444,8 +277,8 @@ class App(QMainWindow):
             return
         self.file_path.setText(path)
         self.load_button.setEnabled(False)
-        def load(progress):
-            fields, records = read_excel(path)
+        def load(progress, cancel_event):
+            fields, records = read_excel(path, cancel_event=cancel_event)
             step = max(1, (len(records) + 499) // 500)
             sample = records[::step][:500]
             numeric_fields = {field for field in fields
@@ -463,6 +296,7 @@ class App(QMainWindow):
         self._callbacks[task_id] = (on_success, error_title)
         worker.signals.succeeded.connect(self._task_succeeded)
         worker.signals.failed.connect(self._task_failed)
+        worker.signals.cancelled.connect(self._task_cancelled)
         worker.signals.progress.connect(self._task_progress)
         self.status_label.setText(status)
         self.progress.show()
@@ -474,9 +308,11 @@ class App(QMainWindow):
         if not self._workers:
             self.progress.hide()
             self.status_label.setText('就绪')
-        if worker is not None and callback:
+        if worker is not None and callback and not self._closing:
             callback(result)
         self.load_button.setEnabled(True)
+        if self._closing and not self._workers:
+            QTimer.singleShot(0, self.close)
 
     def _task_failed(self, task_id, error):
         self._workers.pop(task_id, None)
@@ -485,7 +321,19 @@ class App(QMainWindow):
             self.progress.hide()
             self.status_label.setText('就绪')
         self.load_button.setEnabled(True)
-        QMessageBox.warning(self, title, error)
+        if not self._closing:
+            QMessageBox.warning(self, title, error)
+        if self._closing and not self._workers:
+            QTimer.singleShot(0, self.close)
+
+    def _task_cancelled(self, task_id):
+        self._workers.pop(task_id, None)
+        self._callbacks.pop(task_id, None)
+        if not self._workers:
+            self.progress.hide()
+            self.status_label.setText('就绪')
+            if self._closing:
+                QTimer.singleShot(0, self.close)
 
     def _task_progress(self, message):
         self.status_label.setText(message)
@@ -510,6 +358,7 @@ class App(QMainWindow):
         self.table.setColumnWidth(0, 58)
         for col in range(1, len(fields) + 1):
             self.table.setColumnWidth(col, 150)
+        self._fit_after_filter = True
         self.apply_filters()
         self._log(f'导入成功：{len(records):,} 行，{len(fields)} 列。')
 
@@ -582,8 +431,11 @@ class App(QMainWindow):
             self.filtered = result
             self.table_model.set_content(self.fields, self.filtered, self.checked)
             self._update_count()
+            if self._fit_after_filter:
+                self._fit_after_filter = False
+                QTimer.singleShot(0, self.auto_fit_columns)
 
-        self._run_task(lambda progress: filter_records(rows, conditions=conditions), finished,
+        self._run_task(lambda progress, cancel: filter_records(rows, conditions=conditions, cancel_event=cancel), finished,
                        '正在筛选数据…', error_title='筛选失败')
 
     def auto_fit_columns(self, column=None):
@@ -592,9 +444,9 @@ class App(QMainWindow):
         columns = [column] if column is not None else range(1, len(self.fields) + 1)
         metrics = QFontMetrics(self.table.font())
         rows = self.filtered
-        if len(rows) > 240:
-            step = max(1, len(rows) // 240)
-            sample = rows[::step][:240]
+        if len(rows) > 80:
+            step = max(1, len(rows) // 80)
+            sample = rows[::step][:80]
         else:
             sample = rows
         for col in columns:
@@ -604,7 +456,7 @@ class App(QMainWindow):
             width = metrics.horizontalAdvance(field) + 34
             for record in sample:
                 value = text_of(record.get(field), field)
-                width = max(width, metrics.horizontalAdvance(value) + 28)
+                width = max(width, metrics.horizontalAdvance(value[:120]) + 28)
             self.table.setColumnWidth(col, max(80, min(620, width)))
         self.table.setColumnWidth(0, 58)
 
@@ -644,7 +496,7 @@ class App(QMainWindow):
         self.selection_generation += 1
         generation = self.selection_generation
 
-        def task(progress):
+        def task(progress, cancel_event):
             result = set(checked)
             keys = (row['_id'] for row in rows)
             if mode == 'all':
@@ -660,7 +512,7 @@ class App(QMainWindow):
                 return
             self.checked = result
             self.table_model.checked = self.checked
-            self.table_model.refresh_checks()
+            self._refresh_visible_checks()
 
         self._run_task(task, finished, '正在更新勾选状态…', error_title='更新失败')
 
@@ -670,7 +522,19 @@ class App(QMainWindow):
             key = self.filtered[index.row()].get('_id')
             if key:
                 self.checked.add(key)
-        self.table_model.refresh_checks()
+        self._refresh_visible_checks()
+
+    def _refresh_visible_checks(self):
+        if not self.filtered:
+            self.table_model.checkedChanged.emit()
+            return
+        top = self.table.indexAt(self.table.viewport().rect().topLeft()).row()
+        bottom = self.table.indexAt(self.table.viewport().rect().bottomRight()).row()
+        if top < 0:
+            top = 0
+        if bottom < top:
+            bottom = min(len(self.filtered) - 1, top + 80)
+        self.table_model.refresh_checks(top, bottom)
 
     def move_field(self, delta):
         row = self.fields_list.currentRow()
@@ -698,17 +562,9 @@ class App(QMainWindow):
             raise ValueError('警示阈值必须是 0-100 之间的数字')
         return {'ids': set(self.checked), 'fields': fields, 'warning': warning,
                 'mode': self.mode_combo.currentText(),
-                'group': self.group_check.isChecked() or bool(self.mapping_path.text()),
+                'group': self.group_check.isChecked() or self.mapping_stores[self.kind_combo.currentText()].has_mappings(),
                 'title': self.title_edit.text().strip() or '售后活动执行进度通知',
                 'records': self.records}
-
-    @staticmethod
-    def _prepare(snapshot):
-        ids = set(snapshot['ids'])
-        selected = [row for row in snapshot['records'] if row.get('_id') in ids]
-        jobs = make_jobs(selected, snapshot['fields'], group_by_shop=snapshot['group'],
-                         page_size=12, columns_per_page=6, title=snapshot['title'])
-        return prepare_messages(jobs, snapshot['mode'], snapshot['warning'])
 
     def preview(self):
         try:
@@ -717,8 +573,8 @@ class App(QMainWindow):
             QMessageBox.warning(self, '无法预览', str(exc))
             return
 
-        def task(progress):
-            messages = self._prepare(snapshot)
+        def task(progress, cancel_event):
+            messages = prepare_selection(snapshot)
             return messages[0].payload, snapshot['mode'], len(messages)
 
         self._run_task(task, self._show_preview, '正在后台校验并生成消息预览…',
@@ -761,25 +617,10 @@ class App(QMainWindow):
             Path(path).write_bytes(payload)
             QMessageBox.information(dialog, '已保存', path)
 
-    def choose_map(self):
-        path, _ = QFileDialog.getOpenFileName(self, '导入店铺编码映射', '', 'CSV (*.csv)')
-        if path:
-            self.mapping_path.setText(path)
-
-    def _validate_routes(self, jobs, mapping, kind, webhook, corp, secret, agent, user):
-        if mapping:
-            missing = sorted({(job.store_code, job.store_name) for job in jobs
-                              if not job.store_code or job.store_code not in mapping})
-            if missing:
-                details = '、'.join(f'{code or "（无编码）"} {name}' for code, name in missing[:8])
-                raise ValueError('以下服务店没有接收映射，已阻止整批发送：' + details)
-            if kind == '群机器人Webhook':
-                for value in mapping.values():
-                    check_webhook(value)
-        elif kind == '群机器人Webhook':
-            check_webhook(webhook)
-        elif not user.strip():
-            raise ValueError('应用消息需要填写接收人 UserID，或者使用按店的映射 CSV')
+    def manage_mappings(self):
+        dialog = MappingDialog(self.mapping_stores[self.kind_combo.currentText()], self.kind_combo.currentText(), self)
+        if dialog.exec():
+            self._log('服务店接收映射已保存。')
 
     def send_now(self):
         try:
@@ -790,17 +631,16 @@ class App(QMainWindow):
             options = {'kind': kind, 'webhook': self.webhook_edit.text(),
                        'corp': self.corpid_edit.text(), 'secret': self.secret_edit.text(),
                        'agent': self.agentid_edit.text(), 'user': self.touser_edit.text(),
-                       'mapping_path': self.mapping_path.text()}
+                       'mapping_enabled': self.mapping_stores[self.kind_combo.currentText()].has_mappings()}
         except ValueError as exc:
             QMessageBox.warning(self, '发送配置', str(exc))
             return
 
-        def prepare(progress):
-            prepared = self._prepare(snapshot)
-            mapping = read_mapping(options['mapping_path'], kind)
-            self._validate_routes([message.job for message in prepared], mapping, kind,
-                                  options['webhook'], options['corp'], options['secret'],
-                                  options['agent'], options['user'])
+        def prepare(progress, cancel_event):
+            prepared = prepare_selection(snapshot)
+            mapping = self.mapping_stores[kind].as_dict() if options['mapping_enabled'] else {}
+            validate_routes([message.job for message in prepared], mapping, kind,
+                            options['webhook'], options['user'])
             if kind == '自建应用消息' and not all((options['corp'].strip(),
                     options['secret'].strip(), options['agent'].strip())):
                 raise ValueError('自建应用需要填写 CorpID、Secret、AgentID')
@@ -833,14 +673,14 @@ class App(QMainWindow):
         self.stop_button.setEnabled(True)
         self._log(f'开始发送 {len(prepared)} 条已校验消息。')
 
-        def process(progress):
+        def process(progress, cancel_event):
             ok = 0
             failed = 0
             try:
                 sender = WeComSender(kind, webhook=options['webhook'], corpid=options['corp'],
                     secret=options['secret'], agentid=options['agent'], touser=options['user'])
                 for index, item in enumerate(prepared, 1):
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or cancel_event.is_set():
                         progress('操作已停止：后续未发送的消息已取消')
                         break
                     job = item.job
@@ -886,23 +726,22 @@ class App(QMainWindow):
         self.log.append(f'{datetime.now().strftime("%H:%M:%S")}  {line}')
 
     def closeEvent(self, event):
-        if self._workers and not self.sending:
-            QMessageBox.information(self, '后台任务仍在执行',
-                                    '请等待当前导入、筛选或校验任务完成后再退出。')
-            event.ignore()
-            return
-        if self.sending:
-            answer = QMessageBox.question(self, '正在处理', '当前发送仍在执行。确认退出吗？',
+        if self._workers:
+            answer = QMessageBox.question(
+                self, '后台任务仍在执行', '正在请求停止后台任务。当前网络请求结束后会自动关闭，是否继续？',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
+                QMessageBox.StandardButton.Yes)
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-        self.stop_event.set()
-        if self.sending:
-            self.pool.waitForDone(18000)
+            self._closing = True
+            self.stop_event.set()
+            for worker in self._workers.values():
+                worker.cancel_event.set()
+            self.status_label.setText('正在取消后台任务，完成后自动关闭…')
+            event.ignore()
+            return
         try:
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
             data = {'fields': [self.fields_list.item(i).text()
                                for i in range(self.fields_list.count())
                                if self.fields_list.item(i).checkState() == Qt.CheckState.Checked],
@@ -912,7 +751,7 @@ class App(QMainWindow):
                     'warn_rate': self.warning_edit.text(),
                     'group_by_shop': self.group_check.isChecked(),
                     'kind': self.kind_combo.currentText()}
-            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            self.config_store.save(data)
         except OSError:
             pass
         event.accept()
