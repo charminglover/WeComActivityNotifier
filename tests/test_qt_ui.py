@@ -15,6 +15,8 @@ from ui.mapping_dialog import MappingDialog, MappingEntryDialog
 from services.mapping_store import MappingStore
 from services.config_store import ConfigStore
 from services.notification_workflow import prepare_selection
+from services.title_rules import field_token
+from ui.title_settings import TitleSettings
 
 from main import App, FilterCondition, RecordTableModel
 
@@ -106,6 +108,35 @@ class TestQtTable(unittest.TestCase):
         self.assertEqual(edited.target.text(), 'https://example.test/old')
         self.assertEqual(edited.values(), {
             'id': 'saved-id', 'value': 'NEW', 'target': 'https://example.test/old'})
+
+    def test_visual_title_selection_combination_insertion_and_restore(self):
+        widget = TitleSettings()
+        rows = [{'区域': '华东', '门店': 'A店'}, {'区域': '华南', '门店': 'B店'}]
+        widget.set_fields(['区域', '门店'], rows)
+        widget.set_context(route_field='区域')
+        self.assertIn('华东通知', widget.preview.text())
+        self.assertIn('华南通知', widget.preview.text())
+        widget.mode.setCurrentIndex(widget.mode.findData('field'))
+        widget.field.setCurrentText('门店')
+        widget.prefix.setText('【')
+        widget.suffix.setText('】日报')
+        self.assertIn('【A店】日报', widget.preview.text())
+        widget.mode.setCurrentIndex(widget.mode.findData('custom'))
+        widget.show()
+        widget.insert_field.setCurrentText('区域')
+        QTest.mouseClick(widget.insert_button, Qt.MouseButton.LeftButton)
+        widget.template.insert(' - ')
+        widget.insert_field.setCurrentText('门店')
+        QTest.mouseClick(widget.insert_button, Qt.MouseButton.LeftButton)
+        widget.template.insert(' 日报')
+        self.assertEqual(widget.template.text(), field_token('区域') + ' - ' + field_token('门店') + ' 日报')
+        self.assertIn('华东 - A店 日报', widget.preview.text())
+        restored = TitleSettings(widget.configuration())
+        restored.set_fields(['区域', '门店'], rows)
+        self.assertEqual(restored.preview.text(), widget.preview.text())
+        legacy = TitleSettings(legacy_title='旧版自定义标题')
+        self.assertEqual(legacy.mode.currentData(), 'custom')
+        self.assertEqual(legacy.template.text(), '旧版自定义标题')
 
     def test_mapping_buttons_add_edit_save_reopen_and_delete(self):
         with tempfile.TemporaryDirectory() as directory:

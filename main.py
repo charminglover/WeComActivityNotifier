@@ -21,6 +21,7 @@ from services.task_worker import Worker
 from services.config_store import ConfigStore
 from services.mapping_store import MappingStore
 from ui.mapping_dialog import MappingDialog
+from ui.title_settings import TitleSettings
 
 APP_NAME = '企业微信活动通知工具'
 
@@ -36,7 +37,7 @@ APP_NAME = '企业微信活动通知工具'
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f'{APP_NAME}  v3.1')
+        self.setWindowTitle(f'{APP_NAME}  v3.2')
         self.resize(1320, 860)
         self.setMinimumSize(1000, 680)
         self.setFont(QFont('Microsoft YaHei UI', 9))
@@ -197,16 +198,13 @@ class App(QMainWindow):
         settings_layout.addLayout(preview_actions)
         form = QFormLayout()
         settings_layout.addLayout(form)
-        saved_title = self.prefs.get('msg_title', '')
-        if saved_title == '数据通知':
-            saved_title = ''
-        self.title_edit = QLineEdit(saved_title)
-        self.title_edit.setPlaceholderText(
-            '留空时自动生成；可用 {group_field} 和 {group_value}，例如“{group_value}活动通知”')
-        form.addRow('通知标题 / 模板', self.title_edit)
+        self.title_settings = TitleSettings(self.prefs.get('title_rule'),
+                                             legacy_title=self.prefs.get('msg_title', ''))
+        form.addRow('通知标题', self.title_settings)
         self.group_field_combo = QComboBox()
         self.group_field_combo.addItem('不分组', '')
         self.group_field_combo.setToolTip('选择任意导入列作为内容分组依据；接收目标由映射匹配字段决定。')
+        self.group_field_combo.currentIndexChanged.connect(self._update_title_context)
         form.addRow('分组字段', self.group_field_combo)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(['图片表格', 'Markdown表格', EXCEL_MODE])
@@ -321,6 +319,17 @@ class App(QMainWindow):
         except (OSError, ValueError) as exc:
             message = f'无法读取映射设置：{exc}'
         self.mapping_summary.setText(message)
+        self._update_title_context()
+
+    def _update_title_context(self, *args):
+        route_field = ''
+        if hasattr(self, 'kind_combo'):
+            try:
+                settings = self.mapping_stores[self.kind_combo.currentText()].settings()
+                route_field = settings['field'] if settings['count'] else ''
+            except (OSError, ValueError):
+                pass
+        self.title_settings.set_context(self.group_field_combo.currentData() or '', route_field)
 
     def choose_excel(self):
         path, _ = QFileDialog.getOpenFileName(self, '选择 Excel 文件', '',
@@ -445,6 +454,8 @@ class App(QMainWindow):
         index = self.group_field_combo.findData(selected)
         self.group_field_combo.setCurrentIndex(max(0, index))
         self.group_field_combo.blockSignals(False)
+        self.title_settings.set_fields(self.fields, self.records[:80])
+        self._update_title_context()
 
     def add_highlight_condition(self, condition=None):
         if not self.fields:
@@ -675,9 +686,6 @@ class App(QMainWindow):
         except ValueError as exc:
             raise ValueError('请检查重点标注条件：' + str(exc)) from exc
         group_field = self.group_field_combo.currentData() or ''
-        title_template = self.title_edit.text().strip()
-        if not title_template:
-            title_template = '{group_value}通知' if group_field else '数据通知'
         try:
             settings = self.mapping_stores[self.kind_combo.currentText()].settings()
         except (OSError, ValueError) as exc:
@@ -685,11 +693,14 @@ class App(QMainWindow):
         route_field = settings['field'] if settings['count'] else ''
         if settings['count'] and (not route_field or route_field not in self.fields):
             raise ValueError(f'当前文件缺少映射匹配列“{route_field}”，请在管理映射中更换匹配字段。')
+        self.title_settings.set_context(group_field, route_field)
+        self.title_settings.rule()
         return {'ids': set(self.checked), 'fields': fields,
                 'mode': self.mode_combo.currentText(),
                 'include_excel': self.include_excel_check.isChecked() and self.mode_combo.currentText() != EXCEL_MODE,
                 'group_field': group_field, 'route_field': route_field,
-                'title': title_template, 'highlight_conditions': highlight_conditions,
+                'title': '数据通知', 'title_rule': self.title_settings.configuration(),
+                'highlight_conditions': highlight_conditions,
                 'records': self.records}
 
     def preview(self):
@@ -861,7 +872,7 @@ class App(QMainWindow):
                         break
                     job = item.job
                     recipient = mapping[job.route_value] if mapping else ''
-                    label = job.group_value or job.route_value or '汇总'
+                    label = job.title or job.group_value or job.route_value or '汇总'
                     try:
                         sender.send(item, mode, recipient, highlight_conditions=highlight_conditions)
                         ok += 1
@@ -925,7 +936,7 @@ class App(QMainWindow):
                     'order': [self.fields_list.item(i).text()
                               for i in range(self.fields_list.count())],
                     'fields_confirmed': True,
-                    'msg_title': self.title_edit.text(), 'mode': self.mode_combo.currentText(),
+                    'title_rule': self.title_settings.configuration(), 'mode': self.mode_combo.currentText(),
                     'include_excel': self.include_excel_check.isChecked(),
                     'group_field': self.group_field_combo.currentData() or '',
                     'highlight_conditions': self._collect_highlight_conditions(strict=False),

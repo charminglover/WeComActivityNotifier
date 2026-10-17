@@ -8,7 +8,8 @@ def prepare_selection(snapshot: dict):
     selected_ids = set(snapshot['ids'])
     selected = [row for row in snapshot['records'] if row.get('_id') in selected_ids]
     options = {'title': snapshot['title'], 'group_by_field': snapshot.get('group_field', ''),
-               'route_field': snapshot.get('route_field', '')}
+               'route_field': snapshot.get('route_field', ''),
+               'title_rule': snapshot.get('title_rule')}
     attachment_only = snapshot['mode'] == EXCEL_MODE
     jobs = make_jobs(selected, snapshot['fields'], page_size=None if attachment_only else 12,
                      columns_per_page=None if attachment_only else 6, **options)

@@ -304,12 +304,13 @@ class Job:
     group_value: str = ''
     route_field: str = ''
     route_value: str = ''
+    title_key: tuple[str, ...] = ()
 
 
 def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = False,
               page_size: int | None = 8, columns_per_page: int | None = 7, title: str = '数据通知',
               group_by_field: str = '', route_by_store: bool = False,
-              route_field: str = '') -> list[Job]:
+              route_field: str = '', title_rule: dict | None = None) -> list[Job]:
     """Build message pages, optionally grouped by any imported column.
 
     Routing is independent of content grouping. ``None`` page limits retain a
@@ -325,28 +326,38 @@ def make_jobs(records: list[dict], fields: list[str], group_by_shop: bool = Fals
         route_field = KEY_STORE
     if route_field and any(route_field not in row for row in records):
         raise ValueError(f'所选记录缺少映射匹配列“{route_field}”，请重新选择匹配字段。')
+    compiled_title = None
+    if title_rule is not None:
+        from services.title_rules import compile_title_rule
+        compiled_title = compile_title_rule(title_rule, records[0].keys(), group_by_field, route_field)
     page_size = 1_048_575 if page_size is None else max(1, min(30, int(page_size)))
     columns_per_page = 16_384 if columns_per_page is None else max(2, min(10, int(columns_per_page)))
     groups = defaultdict(list)
     for row in records:
+        if compiled_title:
+            for field in compiled_title.fields:
+                if field not in row:
+                    raise ValueError(f'所选记录缺少标题来源列“{field}”，请检查所选工作表或更换标题列。')
+        title_values = tuple(text_of(row.get(field), field) for field in compiled_title.fields) if compiled_title else ()
         code = text_of(row.get(KEY_STORE)) if route_field == KEY_STORE else ''
         name = text_of(row.get(NAME_STORE)) if route_field == KEY_STORE else ''
         route_value = text_of(row.get(route_field), route_field) if route_field else ''
         group_value = text_of(row.get(group_by_field), group_by_field) if group_by_field else ''
-        groups[(code, name, route_value, group_value)].append(row)
+        groups[(code, name, route_value, group_value, title_values)].append(row)
     jobs = []
-    for (code, name, route_value, group_value), entries in groups.items():
+    for (code, name, route_value, group_value, title_values), entries in groups.items():
         row_parts = [entries[i:i+page_size] for i in range(0, len(entries), page_size)]
         field_parts = [fields[i:i+columns_per_page] for i in range(0, len(fields), columns_per_page)]
         part_total = len(row_parts) * len(field_parts)
-        group_title = title.replace('{group_field}', group_by_field).replace('{group_value}', group_value)
+        group_title = (compiled_title.render(dict(zip(compiled_title.fields, title_values)))
+                       if compiled_title else title.replace('{group_field}', group_by_field).replace('{group_value}', group_value))
         start = len(jobs)
         for rowpart in row_parts:
             for fieldpart in field_parts:
                 jobs.append(Job(title=group_title, fields=fieldpart, rows=rowpart, store_code=code,
                                 store_name=name, parts=part_total, group_field=group_by_field,
                                 group_value=group_value, route_field=route_field,
-                                route_value=route_value))
+                                route_value=route_value, title_key=title_values))
         for idx, job in enumerate(jobs[start:], 1):
             job.part = idx
     return jobs
@@ -582,7 +593,8 @@ class PreparedMessage:
 
 
 def excel_filename(job: Job) -> str:
-    name = job.title + (f'_{job.route_value}' if job.route_value else '')
+    labels = list(dict.fromkeys(value for value in (job.title, job.route_value, job.group_value) if value))
+    name = '_'.join(labels)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:110] or '数据通知'
     if name.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL',
                                      *[f'COM{i}' for i in range(1, 10)],
@@ -654,7 +666,8 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
         groups = defaultdict(list)
         for msg in prepared:
             groups[(msg.job.route_field, msg.job.route_value, msg.job.store_code,
-                    msg.job.store_name, msg.job.group_field, msg.job.group_value)].append(msg)
+                    msg.job.store_name, msg.job.group_field, msg.job.group_value,
+                    msg.job.title_key, msg.job.title)].append(msg)
         for group in groups.values():
             for idx, msg in enumerate(group, 1):
                 msg.job.part, msg.job.parts = idx, len(group)
@@ -680,6 +693,15 @@ def prepare_messages(jobs: list[Job], mode: str = '图片表格', warning_rate: 
         if len(final) > max_messages:
             raise ValueError(f'本批超过 {max_messages} 条消息，已取消发送')
         if not split_again:
+            if mode == EXCEL_MODE:
+                used_names = set()
+                for message in final:
+                    stem = message.filename[:-5]
+                    sequence = 2
+                    while message.filename.casefold() in used_names:
+                        message.filename = f'{stem}_{sequence}.xlsx'
+                        sequence += 1
+                    used_names.add(message.filename.casefold())
             return final
         prepared = final
     raise ValueError('分页校验未能收敛，已取消发送，请减少超长字段')
