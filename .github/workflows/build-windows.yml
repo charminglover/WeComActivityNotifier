@@ -37,9 +37,9 @@ jobs:
       - name: Verify Excel and image-table features
         run: python build_smoke_test.py
 
-      - name: Build one-file Windows application
+      - name: Build directory-based Windows application
         run: >-
-          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
           --name WeComActivityNotifier
           --hidden-import xlrd
           --collect-all openpyxl
@@ -50,7 +50,7 @@ jobs:
       - name: Verify the packaged application starts
         shell: pwsh
         run: |
-          $exe = Join-Path $PWD "dist/WeComActivityNotifier.exe"
+          $exe = Join-Path $PWD "dist/WeComActivityNotifier/WeComActivityNotifier.exe"
           if (-not (Test-Path $exe)) { throw "EXE was not created: $exe" }
           $process = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 8
@@ -60,10 +60,15 @@ jobs:
           }
           Stop-Process -Id $process.Id -Force
 
-      - name: Upload downloadable EXE
+      - name: Package application directory
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/WeComActivityNotifier" -DestinationPath "dist/WeComActivityNotifier-Windows-x64.zip" -CompressionLevel Optimal -Force
+
+      - name: Upload downloadable Windows application
         uses: actions/upload-artifact@v4
         with:
           name: WeComActivityNotifier-Windows-x64
-          path: dist/WeComActivityNotifier.exe
+          path: dist/WeComActivityNotifier-Windows-x64.zip
           if-no-files-found: error
           retention-days: 30

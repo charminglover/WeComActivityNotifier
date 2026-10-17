@@ -4,19 +4,19 @@
 
 ## 构建结果
 
-GitHub Actions 会生成单文件：
+GitHub Actions 会生成 Windows x64 目录版程序，并将整个程序文件夹打包为 ZIP：
 
 ```text
-WeComActivityNotifier.exe
+WeComActivityNotifier-Windows-x64.zip
 ```
 
-目标系统为 Windows 10/11 x64。程序通过 PyInstaller `--onefile --windowed` 打包，运行电脑无需另装 Python。首次启动可能需要几秒钟解包。
+目标系统为 Windows 10/11 x64。程序通过 PyInstaller `--onedir --windowed` 打包，运行电脑无需另装 Python。目录版启动时无需每次解压整个程序，通常比单文件版更快。
 
 ## GitHub Actions 构建
 
 将本目录内容提交到 GitHub 仓库的 `main` 或 `master` 分支后，工作流会在相关文件变更时自动构建。也可以在仓库的 **Actions → Build Windows EXE → Run workflow** 手动启动。
 
-构建成功后，在对应运行记录页面的 **Artifacts** 区域下载 `WeComActivityNotifier-Windows-x64`，解压即可得到 EXE。演示工作簿只用于构建时验证导入、筛选和图片表格生成，不会被嵌入 EXE；用户可以在程序中选择自己的 Excel 文件。
+构建成功后，在对应运行记录页面的 **Artifacts** 区域下载 `WeComActivityNotifier-Windows-x64`，解压 ZIP 后保留完整的 `WeComActivityNotifier` 文件夹，并运行其中的 `WeComActivityNotifier.exe`。不要单独移动 EXE，否则会缺少运行依赖。演示工作簿只用于构建时验证导入、筛选和图片表格生成，不会被打进程序；用户可以在程序中选择自己的 Excel 文件。
 
 ## 功能与凭据
 
@@ -29,7 +29,7 @@ WeComActivityNotifier.exe
 ```powershell
 python -m pip install -r requirements.txt
 python build_smoke_test.py
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name WeComActivityNotifier --hidden-import xlrd --collect-all openpyxl --collect-all PIL --collect-all certifi main.py
+python -m PyInstaller --noconfirm --clean --onedir --windowed --name WeComActivityNotifier --hidden-import xlrd --collect-all openpyxl --collect-all PIL --collect-all certifi main.py
 ```
 
-产物位于 `dist\WeComActivityNotifier.exe`。
+产物位于 `dist\WeComActivityNotifier\` 文件夹中，启动程序为 `dist\WeComActivityNotifier\WeComActivityNotifier.exe`。
