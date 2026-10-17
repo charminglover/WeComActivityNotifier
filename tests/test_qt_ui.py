@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QThreadPool, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QHeaderView, QLineEdit, QTableView
 from ui.table_model import CheckboxDelegate
@@ -23,6 +23,17 @@ class TestQtTable(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self):
+        # Drain asynchronous persistence before deleting test windows. Relying
+        # on Python interpreter shutdown leaves Qt objects and worker callbacks
+        # alive in an undefined destruction order on Windows.
+        self.assertTrue(QThreadPool.globalInstance().waitForDone(5000))
+        self.app.processEvents()
+        for widget in self.app.topLevelWidgets():
+            widget.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
 
     def test_virtual_model_and_check_state(self):
         model = RecordTableModel()
